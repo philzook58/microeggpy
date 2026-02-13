@@ -30,3 +30,9 @@ def test_pattern():
     E.union(a, b)
     E.rebuild()
     assert E.ematch(fx, id1) == [{"x": a}, {"x": b}]
+
+    match fx2:
+        case Term.App("f", _):
+            assert True
+        case _:
+            assert False

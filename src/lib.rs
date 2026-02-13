@@ -94,4 +94,15 @@ mod microeggpy {
             format!("{self:?}")
         }
     }
+
+    /*
+        Next steps:
+        Maybe rebuild should just return a new egraph anyhow
+        Aegraph?
+        extraction
+        iteration or dictionary serialization
+        If I inlined there'd be less duplication
+
+
+    */
 }
