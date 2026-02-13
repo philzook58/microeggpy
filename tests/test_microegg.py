@@ -36,3 +36,10 @@ def test_pattern():
             assert True
         case _:
             assert False
+
+    assert E.to_list() == [
+        (("a", []), 2),
+        (("f", [0]), 1),
+        (("b", []), 2),
+        (("f", [2]), 1),
+    ]

@@ -86,6 +86,14 @@ mod microeggpy {
                 })
                 .collect()
         }
+
+        pub fn to_list(&self) -> Vec<((String, Vec<Id>), Id)> {
+            self.inner
+                .nodes
+                .iter()
+                .map(|(node, id)| ((node.f.to_string(), node.args.clone()), *id))
+                .collect()
+        }
     }
 
     #[pymethods]
