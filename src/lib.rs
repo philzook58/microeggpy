@@ -5,6 +5,7 @@ mod microeggpy {
     use microegg::Pattern;
     use microegg::{EGraph, Id};
     use pyo3::prelude::*;
+    use std::collections::HashMap;
 
     #[pyclass(name = "EGraph", unsendable)]
     #[derive(Default)]
@@ -12,10 +13,33 @@ mod microeggpy {
         inner: EGraph,
     }
 
-    #[pyclass(name = "Pattern", eq, frozen, hash, unsendable)]
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-    pub struct PyPattern {
-        inner: Pattern,
+    #[pyclass(name = "Term", eq, frozen, hash, unsendable)]
+    #[derive(PartialEq, Eq, Hash, Clone, Debug)]
+    pub enum PyTerm {
+        Var(String),
+        App(String, Vec<PyTerm>),
+    }
+
+    impl From<PyTerm> for Pattern {
+        fn from(term: PyTerm) -> Self {
+            match term {
+                PyTerm::Var(name) => Pattern::Var(name.into()),
+                PyTerm::App(f, args) => {
+                    Pattern::App(f.into(), args.into_iter().map(Pattern::from).collect())
+                }
+            }
+        }
+    }
+
+    impl From<Pattern> for PyTerm {
+        fn from(pat: Pattern) -> Self {
+            match pat {
+                Pattern::Var(name) => PyTerm::Var(name.to_string()),
+                Pattern::App(f, args) => {
+                    PyTerm::App(f.to_string(), args.into_iter().map(Pattern::into).collect())
+                }
+            }
+        }
     }
 
     #[pymethods]
@@ -47,6 +71,27 @@ mod microeggpy {
 
         pub fn __repr__(&self) -> String {
             format!("EGraph with {} nodes", self.inner.nodes.len())
+        }
+
+        pub fn ematch(&self, pat: PyTerm, class: Id) -> Vec<HashMap<String, Id>> {
+            let pat: Pattern = pat.into();
+            self.inner
+                .ematch(&pat, class)
+                .into_iter()
+                .map(|subst| {
+                    subst
+                        .into_iter()
+                        .map(|(name, id)| (name.to_string(), id))
+                        .collect::<HashMap<String, Id>>()
+                })
+                .collect()
+        }
+    }
+
+    #[pymethods]
+    impl PyTerm {
+        pub fn __repr__(&self) -> String {
+            format!("{self:?}")
         }
     }
 }

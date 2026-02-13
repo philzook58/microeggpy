@@ -11,3 +11,9 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.11.5",
+    "pytest>=8.3.5",
+]
