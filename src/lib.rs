@@ -6,19 +6,35 @@ mod microegg {
     use std::fmt::Display;
     pub type Id = usize;
     type Name = String;
-    #[pyclass(unsendable)]
+    #[pyclass(unsendable, get_all, frozen, eq, hash)]
     #[derive(PartialEq, Eq, Hash, Clone, Debug)]
     pub struct Node {
-        f: Name,
-        args: Vec<Id>,
+        pub f: Name,
+        pub args: Vec<Id>,
+    }
+    #[pymethods]
+    impl Node {
+        #[new]
+        pub fn new(f: String, args: Vec<Id>) -> Self {
+            Self { f, args }
+        }
+        pub fn __repr__(&self) -> String {
+            let args_str = self
+                .args
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Node({}, [{}])", self.f, args_str)
+        }
     }
 
-    #[pyclass(unsendable)]
+    #[pyclass(unsendable, get_all)]
     #[derive(Default)]
     pub struct EGraph {
-        memo: HashMap<Node, Id>,
-        uf: Vec<Id>,
-        rules: Vec<(Term, Term)>,
+        pub memo: HashMap<Node, Id>,
+        pub uf: Vec<Id>,
+        pub rules: Vec<(Term, Term)>,
     }
 
     #[pyclass(eq, frozen, hash, unsendable, str)]
@@ -226,7 +242,7 @@ mod microegg {
         }
 
         pub fn run(&mut self, n: usize) {
-            for i in 0..n {
+            for _i in 0..n {
                 for eclass in 1..self.uf.len() {
                     self.apply_rules(eclass);
                 }

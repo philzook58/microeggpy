@@ -1,4 +1,4 @@
-from microegg import EGraph, Term
+from microegg import EGraph, Term, Node
 from dataclasses import dataclass
 
 
@@ -115,3 +115,16 @@ def test_extract_skips_cycles():
     cost, term = E.extract(fa)
     assert cost == 1
     assert term == Term.App("a", [])
+
+
+def test_memo():
+    E = EGraph()
+    a = E.add("a", [])
+    b = E.add("b", [])
+    fa = E.add("f", [a])
+    fb = E.add("f", [b])
+    assert len(E.memo) == 4
+    assert len(E.uf) == 4
+    print(E.memo)
+    Node("f", [a]) in E.memo.keys()
+    E.memo[Node("f", [a])] == fa
