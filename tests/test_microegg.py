@@ -128,3 +128,29 @@ def test_memo():
     print(E.memo)
     Node("f", [a]) in E.memo.keys()
     E.memo[Node("f", [a])] == fa
+
+
+def test_compact():
+    E = EGraph()
+    a = E.add("a", [])
+    b = E.add("b", [])
+    c = E.add("c", [])
+    fa = E.add("f", [a])
+    fb = E.add("f", [b])
+    fc = E.add("f", [c])
+    assert E.num_classes() == 6
+    E.union(a, b)
+    E.union(b, c)
+    assert E.num_classes() == 4
+    # compaction should actually do rebuilding also
+    compacted = E.compact()
+    assert len(compacted.nodes) == 4
+    assert compacted.num_classes() == 2
+
+    E.rebuild()
+    compacted = E.compact()
+    assert len(E.nodes) == 6
+    assert E.num_classes() == 2
+
+    assert len(compacted.nodes) == 4
+    assert compacted.num_classes() == 2

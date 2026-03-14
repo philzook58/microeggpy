@@ -33,7 +33,9 @@ mod microegg {
     #[derive(Default)]
     pub struct EGraph {
         pub memo: HashMap<Node, Id>,
+        pub nodes: Vec<Node>, // todo Indexmap
         pub uf: Vec<Id>,
+        pub sibling: Vec<Id>,
         pub rules: Vec<(Term, Term)>,
     }
 
@@ -80,17 +82,32 @@ mod microegg {
 
     impl EGraph {
         pub fn nodes_in_class(&self, class: Id) -> impl Iterator<Item = &Node> {
-            self.memo
-                .iter()
-                .filter(move |(_, id)| self.is_eq(**id, class))
-                .map(|(node, _)| node)
+            let mut id = class;
+            let mut first = true;
+            std::iter::from_fn(move || {
+                if !first && id == class {
+                    return None;
+                }
+                first = false;
+                id = self.sibling[id];
+                Some(&self.nodes[id])
+            })
         }
-        pub fn add_term(&mut self, term: &Term, subst: &Subst) -> Id {
+        pub fn add_term(&mut self, term: &Term, subst: &Subst, depth: usize) -> Id {
             match term {
                 Term::Var(name) => subst[name],
                 Term::App(f, args) => {
-                    let arg_ids = args.iter().map(|arg| self.add_term(arg, subst)).collect();
-                    self.add(f, arg_ids)
+                    let arg_ids = args
+                        .iter()
+                        .map(|arg| self.add_term(arg, subst, depth))
+                        .collect();
+                    self.add_node_rewrite(
+                        Node {
+                            f: f.into(),
+                            args: arg_ids,
+                        },
+                        depth,
+                    )
                 }
             }
         }
@@ -109,8 +126,22 @@ mod microegg {
             } else {
                 let new_id = self.uf.len();
                 self.uf.push(new_id);
+                self.sibling.push(new_id);
+                self.nodes.push(node.clone());
                 self.memo.insert(node, new_id);
                 new_id
+            }
+        }
+
+        #[pyo3(signature = (node, depth=0))]
+        pub fn add_node_rewrite(&mut self, node: Node, depth: usize) -> Id {
+            if depth <= 0 {
+                return self.add_node(node);
+            } else {
+                // If we opened up ematch to one that starts on a node, we could avoid this.
+                let id = self.add_node(node.clone());
+                self.apply_rules(id, depth - 1);
+                self.add_node(node) // micro rebuild
             }
         }
 
@@ -131,6 +162,11 @@ mod microegg {
             let b = self.find(b);
             if a != b {
                 self.uf[a] = b;
+                // Splice together the two loops of siblings
+                let a_next = self.sibling[a];
+                let b_next = self.sibling[b];
+                self.sibling[a] = b_next;
+                self.sibling[b] = a_next;
             }
         }
 
@@ -152,6 +188,11 @@ mod microegg {
             }
         }
 
+        pub fn num_classes(&self) -> usize {
+            // Could track as field in EGraph.
+            (0..self.uf.len()).filter(|&id| self.find(id) == id).count()
+        }
+
         pub fn rebuild(&mut self) {
             // copy needed for borrowing
             let nodes_copy = self.memo.clone();
@@ -169,6 +210,47 @@ mod microegg {
                 }
             }
         }
+
+        fn compact(&self) -> Self {
+            let mut egraph = EGraph::default();
+            let mut root_map = HashMap::new();
+            for (id, node) in self.nodes.iter().enumerate() {
+                let new_node = Node {
+                    f: node.f.clone(),
+                    args: node
+                        .args
+                        .iter()
+                        .map(|id| root_map[&self.find(*id)])
+                        .collect(),
+                };
+                let id2 = egraph.add_node(new_node);
+                let id = self.find(id);
+                if let Some(&existing_id) = root_map.get(&id) {
+                    egraph.union(existing_id, id2);
+                } else {
+                    root_map.insert(id, id2);
+                }
+            }
+            egraph
+        }
+
+        /*
+        let root_map = HashMap::new();
+        fn transfer(root_map : &mut HashMap<Id, Id>, egraph: &mut EGraph, id: Id) -> Id {
+            if let Some(&new_id) = root_map.get(&id) {
+                new_id
+            } else {
+                egraph.
+            }
+        }
+        for id, node in self.nodes.iter().enumerate() {
+            root_map.
+            let node = Node {
+                f: node.f.clone(),
+                args: node.args.iter().map(|id| self.find(*id)).collect(),
+            };
+        }
+        */
 
         pub fn ematch(&self, pat: &Term, class: Id) -> Vec<Subst> {
             self.ematch_rec(0, pat, class, Default::default())
@@ -229,13 +311,14 @@ mod microegg {
             self.add_rule(rhs, lhs);
         }
 
-        pub fn apply_rules(&mut self, eclass: Id) {
+        #[pyo3(signature = (eclass, depth=0))]
+        pub fn apply_rules(&mut self, eclass: Id, depth: usize) {
             // Copy rules so we can mutate the e-graph while iterating matches.
             let rules = self.rules.clone();
             for (lhs, rhs) in &rules {
                 let matches = self.ematch(lhs, eclass);
                 for subst in matches {
-                    let new_id = self.add_term(rhs, &subst);
+                    let new_id = self.add_term(rhs, &subst, depth);
                     self.union(eclass, new_id);
                 }
             }
@@ -244,7 +327,7 @@ mod microegg {
         pub fn run(&mut self, n: usize) {
             for _i in 0..n {
                 for eclass in 1..self.uf.len() {
-                    self.apply_rules(eclass);
+                    self.apply_rules(eclass, 0);
                 }
                 self.rebuild();
             }
@@ -290,70 +373,3 @@ mod microegg {
         }
     }
 }
-
-/*
-    #[pymethods]
-    impl PyEGraph {
-        #[new]
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        pub fn add(&mut self, f: String, args: Vec<Id>) -> Id {
-            self.inner.add(f, args)
-        }
-
-        pub fn union(&mut self, a: Id, b: Id) {
-            self.inner.union(a, b);
-        }
-
-        pub fn find(&self, a: Id) -> Id {
-            self.inner.find(a)
-        }
-
-        pub fn is_eq(&self, a: Id, b: Id) -> bool {
-            self.inner.is_eq(a, b)
-        }
-
-        pub fn rebuild(&mut self) {
-            self.inner.rebuild();
-        }
-
-        pub fn __repr__(&self) -> String {
-            format!("EGraph with {} nodes", self.inner.nodes.len())
-        }
-
-        pub fn ematch(&self, pat: PyTerm, class: Id) -> Vec<HashMap<String, Id>> {
-            let pat: Pattern = pat.into();
-            self.inner
-                .ematch(&pat, class)
-                .into_iter()
-                .map(|subst| {
-                    subst
-                        .into_iter()
-                        .map(|(name, id)| (name.to_string(), id))
-                        .collect::<HashMap<String, Id>>()
-                })
-                .collect()
-        }
-
-        pub fn to_list(&self) -> Vec<((String, Vec<Id>), Id)> {
-            self.inner
-                .nodes
-                .iter()
-                .map(|(node, id)| ((node.f.to_string(), node.args.clone()), *id))
-                .collect()
-        }
-    }
-*/
-
-/*
-    Next steps:
-    Maybe rebuild should just return a new egraph anyhow
-    Aegraph?
-    extraction
-    iteration or dictionary serialization
-    If I inlined there'd be less duplication
-
-
-*/
