@@ -5,6 +5,24 @@ mod microegg {
     use std::collections::HashMap;
     use std::fmt::Display;
     pub type Id = usize;
+    /*
+    #[pyclass(eq, frozen, hash)]
+    #[derive(PartialEq, Eq, Hash, Clone, Debug)]
+    pub enum Id {
+        EId(usize), // Function?
+        Constructor(usize),
+        // Int(usize),
+        // String(String),
+        // OffSet(usize, usize)
+        // Factor(usize, usize)
+        // Thin(Thin, usize)
+
+    }
+
+    fn add_constructor()
+    fn add_function()
+
+    */
     type Name = String;
     #[pyclass(unsendable, get_all, frozen, eq, hash)]
     #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -33,7 +51,7 @@ mod microegg {
     #[derive(Default)]
     pub struct EGraph {
         pub memo: HashMap<Node, Id>,
-        pub nodes: Vec<Node>, // todo Indexmap
+        pub nodes: Vec<Node>, // todo Indexmap?
         pub uf: Vec<Id>,
         pub sibling: Vec<Id>,
         pub rules: Vec<(Term, Term)>,
@@ -201,8 +219,7 @@ mod microegg {
             while keep_going {
                 keep_going = false;
                 for (node, id) in &nodes_copy {
-                    let new_node = self.canonicalize_node(node);
-                    let new_id = self.add_node(new_node);
+                    let new_id = self.add_node(node.clone());
                     if !self.is_eq(new_id, *id) {
                         self.union(new_id, *id);
                         keep_going = true;
@@ -373,3 +390,29 @@ mod microegg {
         }
     }
 }
+/*
+Multi patterns?
+More interesting cost
+
+generalized uf
+constructors
+factor out ematch_node(f, args)
+AC nodes?
+smallvec / smallstrings? intern strings?
+proofs as just a trace.
+analysis? Extensible?
+App. LFHOL
+context?
+backtrackable?
+backtrack(id) -> splice out of siblings, remove all nodes beyond...
+trail = [id, id, id]
+
+examples:
+Relational algebra.
+Polynomials
+bitvector
+
+benchmarks
+reduce allocations
+
+*/
