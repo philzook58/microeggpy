@@ -1,4 +1,7 @@
 use pyo3::prelude::*;
+pub mod thin;
+pub mod uf;
+
 #[pymodule]
 mod microegg {
     use pyo3::prelude::*;

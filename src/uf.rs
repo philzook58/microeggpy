@@ -5,6 +5,13 @@ trait UF {
     fn union(&mut self, id1: Self::Id, id2: Self::Id);
 }
 
+trait Group {
+    fn mul(&self, a: &Self) -> Self;
+    fn inv(&self) -> Self;
+    fn id() -> Self;
+}
+
+trait SemiLattice {}
 /*
 
 Slotted Uf
