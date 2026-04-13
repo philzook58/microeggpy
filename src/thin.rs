@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::iter::zip;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Thin(Vec<bool>); // TODO: swtich to bitvec. smallbitvec, or smallvec
+pub struct Thin(Vec<bool>); // TODO: swtich to bitvec. smallbitvec, or smallvec, u32, box_leak;
 // Is there a lighter weight thing if it doesn't need to be resiable? Neh.
 
 impl Thin {
     //! Thinnings are mappings between contexts represented as bitvectors. true means keep, false means drop.
+    //! [x,y,z].thin([true,false,true]) => [x,z]
+    //! [x,z].widen([true,false,true]) => [x,_,z]
     //! https://www.philipzucker.com/thin1/
     pub fn id(n: usize) -> Self {
         Thin(vec![true; n])
@@ -27,6 +29,13 @@ impl Thin {
         self.0.iter().filter(|i| **i).count()
     }
 
+    fn dump0(&self) -> Self {
+        //! Dump the first variable in the context. Useful for lambda abstraction where lambdas create a variable in scope
+        let mut thin = self.0.clone();
+        thin.remove(0);
+        Thin(thin)
+    }
+
     pub fn comp(&self, small: &Thin) -> Thin {
         //! compose self with small. self : A -> B, small : B -> C, output : A -> C
         assert_eq!(self.cod(), small.dom());
@@ -43,19 +52,92 @@ impl Thin {
         Thin(res)
     }
 
-    pub fn lcm(&self, other: &Thin) -> Thin {
-        //! Reconcile two thinnings with common domain. Basically bitwise and.
+    pub fn meet(&self, other: &Thin) -> (Thin, Thin, Thin) {
+        //! widest_common_subthinning
+        //! meet
+        //! Compute the bitwise and widest common thinning and how to get there.
+        //! self.comp(out.1) = other.comp(out.2)
+        //! Pullback?
+        assert_eq!(self.dom(), other.dom());
+        // Should I just do the dumb loop?
+        let mut common = Vec::with_capacity(self.dom());
+        let mut proj_self = vec![];
+        let mut proj_other = vec![];
+        for (&a, &b) in zip(self.0.iter(), other.0.iter()) {
+            common.push(a && b);
+            if a {
+                proj_self.push(b);
+            }
+            if b {
+                proj_other.push(a);
+            }
+        }
+        (Thin(common), Thin(proj_self), Thin(proj_other))
+    }
+    /*
+    let obj = zip(self.0.iter(), other.0.iter())
+        .filter(|(a, b)| **a && **b)
+        .count();
+    let proj_self = zip(self.0.iter(), other.0.iter())
+        .filter_map(|(a, b)| if *a { Some(*b) } else { None })
+        .collect();
+    let proj_other = zip(self.0.iter(), other.0.iter())
+        .filter_map(|(a, b)| if *b { Some(*a) } else { None })
+        .collect();
+
+    (obj, Thin(proj_self), Thin(proj_other))
+    */
+
+    pub fn join(&self, other: &Thin) -> (Thin, Thin, Thin) {
+        //! thinnest_common_superthinning
+        //! join
+        //! union
+        //! bitwise or
+        // pushout?
+        // common prefix
+        assert_eq!(self.dom(), other.dom());
+        let mut prefix = Vec::with_capacity(self.dom());
+        let mut proj_self = vec![];
+        let mut proj_other = vec![];
+        for (&a, &b) in zip(self.0.iter(), other.0.iter()) {
+            prefix.push(a || b);
+            if a || b {
+                proj_self.push(a);
+                proj_other.push(b);
+            }
+        }
+        (Thin(prefix), Thin(proj_self), Thin(proj_other))
+    }
+
+    fn is_ge(&self, other: &Thin) -> bool {
+        //! Is self a subthinning of other? I.e. is there a thinning from self to other?
+        //! Proof relevant version would return the thinning that does it. Does there exists t, such that self . t = other
+        assert_eq!(self.dom(), other.dom());
+        zip(self.0.iter(), other.0.iter()).all(|(a, b)| !*a || *b)
+    }
+
+    // TODO remove.
+    pub fn bitor(&self, other: &Thin) -> Thin {
+        //! bitwise or. Useful for computing the needed context of a node from its children.
         assert_eq!(self.dom(), other.dom());
         Thin(
             zip(self.0.iter(), other.0.iter())
-                .map(|(x, y)| *x && *y)
+                .map(|(x, y)| *x || *y)
                 .collect(),
         )
     }
 
     fn div(&self, small: &Thin) -> Thin {
         //! self.comp(output) = small  if small <= self
+        //! self :   ctxn -> ctxm
+        //! small :  ctxn -> ctxk
+        //! output : ctxm -> ctxk
         assert_eq!(self.dom(), small.dom());
+
+        assert!(
+            self.is_ge(small),
+            "The small thinning should be a sub thinning of the bigger one (self)"
+        ); // small <= self
         Thin(
             zip(self.0.iter(), small.0.iter())
                 .filter(|(_, b)| **b)
@@ -64,6 +146,8 @@ impl Thin {
         )
     }
 }
+
+mod named {}
 
 // Working with named contexts
 pub fn is_subseq<T: Eq>(big: &[T], small: &[T]) -> Option<Thin> {
@@ -85,6 +169,16 @@ pub fn is_subseq<T: Eq>(big: &[T], small: &[T]) -> Option<Thin> {
     }
 }
 
+fn apply_thin<T: Clone>(thin: &Thin, big: &[T]) -> Vec<T> {
+    //! Apply a thinning to a big context to get the small context.
+    assert_eq!(thin.dom(), big.len());
+    zip(thin.0.iter(), big.iter())
+        .filter(|(b, _)| **b)
+        .map(|(_, x)| x.clone())
+        .collect()
+}
+
+// This is the named version of pullback?
 fn common_minctx<T: Eq + Clone + Debug>(
     big: &[T],
     small1: &[T],
@@ -101,7 +195,6 @@ fn common_minctx<T: Eq + Clone + Debug>(
     let mut n1 = 0;
     let mut n2 = 0;
     // Reconcile the two minimal contexts. A sorted union
-    dbg!("{} {} {}", big, small1, small2);
     for s in big.iter() {
         let take1 = n1 < small1.len() && small1[n1] == *s;
         let take2 = n2 < small2.len() && small2[n2] == *s;
@@ -129,14 +222,19 @@ pub struct Id(Thin, usize);
 // Possibly Var could be factored to be a case in this enum. Eh. The convention that id = 0 is var seems fine.
 // enum Id { EId(Thin, usize), Var} but Var might still need to be thinng. Id = (Thin, Option<usize) ?
 impl Id {
-    pub fn widen(&self, thin: &Thin) -> Id {
+    pub fn weaken(&self, thin: &Thin) -> Id {
         //! The action of widening / weakening on an Id. Brings the id into a larger context with some unused stuff in the context.
         assert_eq!(thin.cod(), self.0.dom());
         Id(thin.comp(&self.0), self.1)
     }
 
     pub fn ctx(&self) -> usize {
+        //! The big context the Id has currently been lifted to
         self.0.dom()
+    }
+    pub fn minctx(&self) -> usize {
+        //! The minimal context needed to make sense of the rawid.
+        self.0.cod()
     }
     pub fn widen0(&self) -> Self {
         //! Widen to a context with one more variable that is not used. Useful for lambda abstraction when the body doesn't use the bound var.
@@ -145,6 +243,12 @@ impl Id {
         Id(Thin(thin), self.1)
     }
 }
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+struct MinId {
+    ctx: usize,
+    rawid: usize,
+} // An Id that has an implicit Id thinning of size ctx
 // TODO: I should possibly have
 
 /// An ordinary syntax tree for user readability. Using the raw api is very painful and error prone.
@@ -154,10 +258,10 @@ pub enum Term {
     App(Box<Term>, Box<Term>),
     Lam(String, Box<Term>),
     Lit(String),
-    // PVar(String, Vec<String>) Miller pattern var
-    // Id(Id) Embedded eid
-    // Drop(String, Box<Term>) explicitly say a variable is dropped. For weakening to an Id? Or for weakening to pattern variable, which then always captures everything
-    // Kind of the converse of Lam.
+    EId(Id), // Do I want Vec<String> here? Or does the Id narrow from the full context. But I might not even know
+             // PVar(String, Vec<String>) Miller pattern var
+             // Drop(String, Box<Term>) explicitly say a variable is dropped. For weakening to an Id? Or for weakening to pattern variable, which then always captures everything
+             // Kind of the converse of Lam.
 }
 type Pattern = (usize, Term); // first n variables are pattern variables.
 
@@ -197,7 +301,7 @@ enum Node {
     Var,
     Lit(String), // Symbol? Constant
     // Value(Value)
-    UNode(Id, Id),
+    UNode(Id, Id), // Maybe rawid because everything in eclass has same minimal context. No. rawid are terms which have a very concrete
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,7 +314,8 @@ pub fn varid() -> Id {
     Id(Thin::id(1), 0)
 }
 
-type UserId = (Vec<String>, Id);
+type UserId = (Vec<String>, Id); // UserId = (Vec<String>, usize)
+
 /*
 struct UserId { maxctx : Vec<String>, needed : thin, rawid : usize}
 */
@@ -224,12 +329,6 @@ impl EGraph {
             nodes: vec![Node::Var],
             uf: vec![varid()],
         }
-    }
-
-    fn makeset(&mut self, ctx: usize) -> usize {
-        let rawid = self.uf.len();
-        self.uf.push(Id(Thin::id(ctx), rawid));
-        rawid
     }
 
     fn add_node(&mut self, ctx: usize, n: Node) -> Id {
@@ -246,9 +345,36 @@ impl EGraph {
 
     pub fn app(&mut self, f: Id, x: Id) -> Id {
         assert!(f.ctx() == x.ctx());
+        let f = self.find(&f);
+        let x = self.find(&x);
+        // do find?
         // scan f for lambda? smart constructor loop might terminate?
         // add app node version, only subst version, do both
-        self.add_node(f.ctx(), Node::App(f, x))
+
+        // fthin :  [false, true, false]  : 3 -> 1
+        // xthin :  [false, false, true] : 3 -> 1
+        // common_thin : [false, true, true] : 3 -> 2
+        // common_thin.conj().comp(common_thin) != id ...? Wha? Is this make any sense at all?
+        // common_thin.conj().(fthin) = proj_fthin : [true, false] : 2 -> 1 // projected to common needed context
+        // proj_xthin : [false, true] // projected common needed context
+        // common_thin @ [true, true] |- App(proj_fthin, proj_xthin)
+        // You want to intern in the smallest possible canonical context
+
+        // Construct the app in the smallest common needed context
+        let (common, f1thin, x1thin) = f.0.join(&x.0);
+        let id = self.add_node(common.cod(), Node::App(Id(f1thin, f.1), Id(x1thin, x.1)));
+        // Lift back into context actually requested
+        id.weaken(&common)
+
+        /*
+        let thin_to_needed = f.0.bitor(&x.0); // bitwise or
+        assert!(thin_to_needed.0.iter().all(|b| *b));
+        // Wait... But shouldn't it e the case that thin_to_needed is all true?
+        let f1 = Id(f.0.div(&thin_to_needed), f.1);
+        let x1 = Id(x.0.div(&thin_to_needed), x.1);
+        let id = self.add_node(thin_to_needed.cod(), Node::App(f1, x1));
+        id.weaken(&thin_to_needed) // widen the id the common context;
+        */
     }
     /*
     pub fn app_beta(&mut self, f : Id, x : Id) -> Id
@@ -270,9 +396,14 @@ impl EGraph {
         self.add_node(0, Node::Lit(s))
     }
 
-    pub fn lam(&mut self, body: Id) -> Id {
+    fn lam(&mut self, body: Id) -> Id {
         assert!(body.ctx() != 0);
-        self.add_node(body.ctx() - 1, Node::Lam(body))
+        // body bigctx HAS to have the bound var in it [],
+        let body = self.find(&body);
+        let thin = body.0.dump0(); // the scope of the lambda is the minctx of the "body.remove(0)", since it hsouldn't matter if body used var or not.
+        // Also here. Everything in body should be true except _possibly_ the first value.
+        let id = self.add_node(thin.cod(), Node::Lam(body.clone()));
+        id.weaken(&thin) // I'm just composing an identity with a thinning. seems wasteful
     }
 
     pub fn find(&self, id: &Id) -> Id {
@@ -280,23 +411,30 @@ impl EGraph {
         loop {
             let Id(thin1, rawid1) = self.uf[rawid].clone();
             if rawid1 == rawid {
+                assert!(thin1.is_id());
                 return Id(thin, rawid);
             } else {
-                thin = thin1.comp(&thin);
+                thin = thin.comp(&thin1);
                 rawid = rawid1;
             }
         }
     }
 
+    pub fn named_find(&self, nid: &UserId) -> UserId {
+        let id = self.find(&nid.1);
+        (apply_thin(&id.0, &nid.0), id)
+    }
     pub fn is_eq(&mut self, a: &Id, b: &Id) -> bool {
         self.find(a) == self.find(b)
     }
-    pub fn union(&mut self, a: &Id, b: &Id) -> Option<Id> {
+
+    //pub fn user_union(ctx : &[String], a : UserId, b : UserId) {}
+    fn union(&mut self, a: &Id, b: &Id) -> bool {
         assert_eq!(a.ctx(), b.ctx(), "Can only union ids in the same context");
         let a = self.find(a);
         let b = self.find(b);
         if a == b {
-            None
+            false
         }
         /*
         // TODO: We can avoid making a new rawid in many cases (?)
@@ -308,17 +446,68 @@ impl EGraph {
         else if
         }*/
         else {
-            let thin = a.0.lcm(&b.0);
-            let Id(_, rawz) = self.add_node(thin.cod(), Node::UNode(a.clone(), b.clone()));
+            let (common, proj_a, proj_b) = Thin::meet(&a.0, &b.0);
+            //let thin = a.0.lcm(&b.0); // bitwise and
+            // This makes no sense. Should I just me using join here?
+            let Id(_, rawz) = self.add_node(
+                common.cod(),
+                Node::UNode(Id(proj_a.clone(), a.1), Id(proj_b.clone(), b.1)),
+            ); //Node::UNode(a.clone(), b.clone()));
             //let rawz = self.makeset(a.ctx()); // Hmm. Maybe this is wrong. I don't want nodes and uf out of sync. Maybe UNode is appropriate
             // Actually unodes are essential for enumeration, because the annotations are tree structured.
             // We actually need to insert carefully into unode tree? no, maybe not.
             // So the monus heap shows up as the enumerator?
-            self.uf[a.1] = Id(thin.div(&a.0), rawz);
-            self.uf[b.1] = Id(thin.div(&b.0), rawz);
-            Some(Id(thin, rawz))
+            self.uf[a.1] = Id(proj_a, rawz);
+            self.uf[b.1] = Id(proj_b, rawz);
+            true
         }
     }
+
+    pub fn named_union(&mut self, ctx: &[String], a: UserId, b: UserId) -> bool {
+        let (minctx, thina, thinb) = common_minctx(ctx, &a.0, &b.0);
+        self.union(&a.1.weaken(&thina), &b.1.weaken(&thinb))
+    }
+
+    pub fn rebuild(&mut self) {
+        loop {
+            let mut done = true;
+            for i in 0..self.nodes.len() {
+                let node = &self.nodes[i];
+                let id = self.find(&self.uf[i]);
+                match node {
+                    Node::Lit(_) => {}
+                    Node::Var => {}
+                    Node::UNode(_, _) => {}
+                    Node::Lam(body) => {
+                        let id1 = self.lam(id.clone());
+                        done &= !self.union(&id, &id1);
+                    }
+                    Node::App(f, x) => {
+                        let id1 = self.app(f.clone(), x.clone());
+                        done &= !self.union(&id, &id1);
+                    }
+                }
+            }
+            if done {
+                return;
+            }
+        }
+    }
+
+    /*
+    fn rebuild(&mut self) {
+        for node in self.nodes.iter() {
+            match node {
+                Node::App(f, x) => {
+                    let fid = self.find(f);
+                    let xid = self.find(x);
+                    let id = self.app(fid, xid);
+                    self.union(id1, id);
+                }
+            }
+        }
+    }
+    */
 
     pub fn nodes_in_class_no_find(&self, id: &Id) -> Vec<Id> {
         // Is it worth making this an Iterator instead of returning Vec?
@@ -329,8 +518,8 @@ impl EGraph {
             match &self.nodes[id.1] {
                 Node::UNode(a, b) => {
                     let thin = id.0;
-                    todo.push(a.widen(&thin));
-                    todo.push(b.widen(&thin));
+                    todo.push(a.weaken(&thin));
+                    todo.push(b.weaken(&thin));
                 }
                 _ => res.push(id),
             }
@@ -352,16 +541,19 @@ impl EGraph {
     // Hmm the isomorphism matching. That might be interesting.
     //fn ematch(&self, )
 
-    pub fn add_term(&mut self, maxctx: &[String], t: Term) -> UserId {
+    // add_term is kind of named_add_node
+
+    fn add_term_helper(&mut self, maxctx: &[String], t: Term) -> UserId {
         // Hmm. UserId could be a thinning from maxctx.
         match t {
-            Term::Var(s) => (vec![s], self.var()),
+            Term::Var(s) => (vec![s], self.var()), //  (maxctx.map(|name| name == s), self.var()
             Term::Lit(s) => (vec![], self.lit(s)),
             Term::App(f, x) => {
-                let (fctx, fid) = self.add_term(maxctx, *f);
-                let (xctx, xid) = self.add_term(maxctx, *x);
+                let (fctx, fid) = self.add_term_helper(maxctx, *f);
+                let (xctx, xid) = self.add_term_helper(maxctx, *x);
                 let (minctx, widef, widex) = common_minctx(maxctx, &fctx, &xctx);
-                (minctx, self.app(fid.widen(&widef), xid.widen(&widex)))
+                // Hmm. What if add_node returns less than I thought? I should thin minctx
+                (minctx, self.app(fid.weaken(&widef), xid.weaken(&widex)))
             }
             Term::Lam(v, body) => {
                 // Search for shadowed x and remove it
@@ -370,18 +562,29 @@ impl EGraph {
                     bodymaxctx.remove(pos);
                 }
                 // v is now available in the body in position 0. Should I reverse the direction I do this?
-                bodymaxctx.insert(0, v.clone());
-                let (mut bodyminctx, mut bid) = self.add_term(&bodymaxctx, *body);
+                bodymaxctx.insert(0, v.clone()); // [x,y,z] -> [v, x,y,z]
+                let (mut bodyminctx, mut bid) = self.add_term_helper(&bodymaxctx, *body);
                 if bodyminctx.len() == 0 || bodyminctx[0] != v {
                     // If the body doesn't use the variable, we need to pad with a false to kill the variable the lambda introduces.
-                    bid = bid.widen0();
+                    bid = bid.widen0(); // [true, false] -> [false, true, false]
                 } else {
                     // If the body does use the bound var, the lam_minctx doesn't have it
-                    bodyminctx.remove(0);
+                    bodyminctx.remove(0); // [v, x] -> [x]
                 }
                 (bodyminctx, self.lam(bid))
             }
+            Term::EId(id) => {
+                assert!(id.ctx() <= maxctx.len());
+                //  = is_ssubseq(maxctx ,id.1).unwrap()
+                (apply_thin(&id.0, maxctx), id)
+            }
         }
+    }
+
+    pub fn add_term(&mut self, ctx: &[String], t: Term) -> UserId {
+        let (minctx, id) = self.add_term_helper(ctx, t);
+        let thin = is_subseq(ctx, &minctx).unwrap();
+        (ctx.to_vec(), id.weaken(&thin))
     }
 }
 
@@ -411,7 +614,7 @@ mod tests {
             &["x".to_string(), "y".to_string()],
             Term::Var("x".to_string()),
         );
-        assert!(x1.0 == vec!["x".to_string()]); // min context is just x, y is not used
+        assert_eq!(x1.0, vec!["x".to_string(), "y".to_string()]);
         let id1 = g.app(x.clone(), y.clone());
         let id2 = g.app(x.clone(), y.clone());
         assert!(id1 == id2);
@@ -444,6 +647,7 @@ mod tests {
             Term::Lam("y".to_string(), Box::new(Term::Var("x".to_string()))),
         );
         assert_eq!(c1.0, vec!["x".to_string()]);
+        dbg!("{}", &c1);
         assert_eq!(c1.1.ctx(), 1);
         //let c2 = g.add_term(&[], Term.Lam("x".to_string(), Box::new(c1.1)));
 
@@ -477,8 +681,8 @@ mod tests {
         assert!(c1 != c2);
         assert!(!g.is_eq(&c1.1, &c2.1));
         assert_eq!(g.nodes_in_class(&c1.1).len(), 1);
-        let c3 = g.union(&c1.1, &c2.1).unwrap();
-        assert_eq!(g.nodes_in_class(&c3).len(), 2);
+        assert!(g.union(&c1.1, &c2.1));
+        assert_eq!(g.nodes_in_class(&c1.1).len(), 2);
         assert!(g.is_eq(&c1.1, &c2.1));
 
         let plusab = g.add_term(
@@ -502,7 +706,8 @@ mod tests {
             ),
         );
         assert!(!g.is_eq(&plusab.1, &plusba.1));
-        let newid = g.union(&plusab.1, &plusba.1).unwrap();
+        assert!(g.union(&plusab.1, &plusba.1));
+        let newid = g.find(&plusab.1);
         assert!(g.is_eq(&plusab.1, &plusba.1));
 
         let n_nodes = g.nodes.len();
@@ -521,5 +726,147 @@ mod tests {
             2,
             "Should have two nodes in class",
         );
+
+        let mut g = EGraph::new();
+        let xzero = g.add_term(
+            &["x".to_string()],
+            Term::app2(Term::lit("+"), Term::var("x"), Term::lit("zero")),
+        );
+        assert_eq!(xzero.0.len(), 1);
+        let zero = g.add_term(&["x".to_string()], Term::lit("zero"));
+        assert_eq!(zero.0.len(), 1);
+        // Hmm. unon a different contexts _could_ mean kill. But
+        //g.union(&zero.1, &xzero.1);
+        g.named_union(&["x".to_string()], zero.clone(), xzero.clone());
+        dbg!(&xzero, &zero, &g.uf);
+        let zero1 = g.named_find(&zero);
+        assert_eq!(zero1.0.len(), 0);
+
+        let zero2 = g.named_find(&xzero);
+        assert_eq!(zero2.0.len(), 0);
+
+        assert_eq!(zero1, zero2);
+
+        // Or is this just wrong. We should never be calling app on something that has
+        // Widening should commute with app  app(f,x).wide() == app(f.wide(), x.wide())
+        // It should also commute with lam.
+
+        /*
+
+        let a0 = g.add_term(&[], Term::lit("a"));
+        let wa = a0.1.widen(&Thin(vec![false])); // widen to a context with one variable that is not used
+        let fa0 = g.add_term(&[], Term::app(Term::lit("f"), Term::EId(a0.1)));
+        let fa1 = g.add_term(&["x".to_string()], Term::app(Term::lit("f"), Term::EId(wa)));
+        assert_eq!(fa0.1, fa1.1, "Widening should commute with app");
+        assert_eq!(fa0.0.len(), 0, "fa0 should have empty minctx");
+        assert_eq!(fa1.0.len(), 0, "fa1 should have empty minctx");
+
+        */
     }
 }
+
+/*
+
+        /*
+        lam x, 5
+        lam(wide([false], lit(5)))
+
+        union(1 |- x * 0, 1 |- wide([false], 0))
+
+        lam x, f(f(f(f(a))))
+        lam(wide([false], f(f(f(f(a))))))
+        lam(drop(x, f(f(f(f(a))))))
+        */
+
+
+    /*fn makeset(&mut self, ctx: usize) -> usize {
+        let rawid = self.uf.len();
+        self.uf.push(Id(Thin::id(ctx), rawid));
+        rawid
+    } */
+
+    /*
+
+    [false, true, true] . [true, false] = [false, true, false]
+
+
+    [true, true, false] @ ([x,y] |- x + y) ===> [x, y, _] |- x + y
+    [true, true, false] @ (2 |- v0 + v1)    ===> 3 |- v0 + v1
+    [true, false , true] @ (2 |- v0 + v1)   ===> 3 |- v0 + v2
+
+    (3 |- a + hole) @ [true, true, false] @ (2 |- v0 + v1)
+
+    All of these are wrong though. They are in half de bruijn
+
+
+    [true, false, true] |-  wide([false,true],v)  + wide([true, false], v) ======  v2 + v0 in the de bruijn sense.
+
+     */
+
+    pub fn lower(&self, thin: &Thin) -> Id {
+        assert!(thin.is_ge(&self.0));
+        Id(thin.div(&self.0), self.1)
+    }
+
+
+{x, y} |- x + y  slotted
+[x, y] |- x + y  thinning
+
+lam {x,y,z}, t(x,y,z)
+lam [x,y,z], t(x,y,z)
+
+sum {x,y,z}, t(x,y,z) slotted
+sum [x,y,z], t(x,y,z)
+
+
+union([x,y] |- f(x,y), [x,y] |- g(x,y))
+union(2, f(v0, v1), g(v0, v1))
+query:
+ [x,y] | f(y,x) = [x,y] |- g(y,x) No
+
+ [y,x] |- f(y,x) = [y,x] |- g(y,x) Yes
+ [x,y] |- f(y,x) = g(y,x)
+ 2 |- f(v1, v0) = g(v1, v0)
+
+
+ {x,y} |- f(x,y) -->   -keyword argument style -> sorting keyword argument <-> positional
+ lam x y z,       positional argument style
+
+global slot ordering but only mappings that monotonic or preserve that ordering --> thinnings
+
+    /// global slot order?
+    ///
+    ///
+    ///
+    ///
+    ///
+    ///
+
+    pub fn lcm(&self, other: &Thin) -> Thin {
+        //! Reconcile two thinnings with common domain. Basically bitwise and.
+        assert_eq!(self.dom(), other.dom());
+        Thin(
+            zip(self.0.iter(), other.0.iter())
+                .map(|(x, y)| *x && *y)
+                .collect(),
+        )
+    }
+
+
+        /*
+    fn divl(&self, other: &Thin) -> Self {
+        //! self : ctxn ->
+        //! small : ctxn ->
+        //! output :
+        other.div(self)
+        /*
+        Thin(
+            zip(self.0.iter(), other.0.iter())
+                .filter(|(a, b)| **a)
+                .map(|(_, b)| *b)
+                .collect(),
+        )
+        */
+    }
+    */
+*/
