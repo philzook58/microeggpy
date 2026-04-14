@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::iter::zip;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Thin(Vec<bool>); // TODO: swtich to bitvec. smallbitvec, or smallvec, u32, box_leak;
-// Is there a lighter weight thing if it doesn't need to be resiable? Neh.
+// Is there a lighter weight thing if it doesn't need to be resizable? Neh.
 
 impl Thin {
     //! Thinnings are mappings between contexts represented as bitvectors. true means keep, false means drop.
@@ -74,19 +74,6 @@ impl Thin {
         }
         (Thin(common), Thin(proj_self), Thin(proj_other))
     }
-    /*
-    let obj = zip(self.0.iter(), other.0.iter())
-        .filter(|(a, b)| **a && **b)
-        .count();
-    let proj_self = zip(self.0.iter(), other.0.iter())
-        .filter_map(|(a, b)| if *a { Some(*b) } else { None })
-        .collect();
-    let proj_other = zip(self.0.iter(), other.0.iter())
-        .filter_map(|(a, b)| if *b { Some(*a) } else { None })
-        .collect();
-
-    (obj, Thin(proj_self), Thin(proj_other))
-    */
 
     pub fn join(&self, other: &Thin) -> (Thin, Thin, Thin) {
         //! thinnest_common_superthinning
@@ -116,34 +103,103 @@ impl Thin {
         zip(self.0.iter(), other.0.iter()).all(|(a, b)| !*a || *b)
     }
 
-    // TODO remove.
-    pub fn bitor(&self, other: &Thin) -> Thin {
-        //! bitwise or. Useful for computing the needed context of a node from its children.
-        assert_eq!(self.dom(), other.dom());
-        Thin(
-            zip(self.0.iter(), other.0.iter())
-                .map(|(x, y)| *x || *y)
-                .collect(),
-        )
+    fn all_comm_squares(&self, other: &Thin) -> Vec<(Thin, Thin)> {
+        // Its not _all_ of them but it is the non tivial ones that form a frontier.
+        assert_eq!(self.cod(), other.cod());
+        let self_ = &self.0;
+        let other = &other.0;
+        let mut todo = vec![(0, vec![], 0, vec![])];
+        let mut res = vec![];
+        while let Some((mut i, mut t1, mut j, mut t2)) = todo.pop() {
+            while (i < self_.len() && self_[i]) || (j <= other.len() && other[j]) {
+                if self_[i] && other[j] {
+                    // Both take pinned value
+                    t1.push(true);
+                    t2.push(true);
+                    i += 1;
+                    j += 1;
+                } else if self_[i] {
+                    // have to take other to get back in sync to true true
+                    // No we can still have true true true happen.
+                    j += 1;
+                    t1.push(false);
+                    t2.push(true);
+                    // No we can also take
+                } else if other[j] {
+                    // have to take self to get back in sync
+                    i += 1;
+                    t1.push(true);
+                    t2.push(false);
+                }
+            }
+            if i == self.0.len() && j == other.len() {
+                let t1 = Thin(t1);
+                let t2 = Thin(t2);
+                assert_eq!(t1.dom(), t2.dom());
+                assert_eq!(t1.cod(), self_.len());
+                assert_eq!(t2.cod(), other.len());
+                res.push((t1, t2))
+            } else {
+                // both false. Need to try both orderings
+                assert!(!self_[i]);
+                assert!(!other[j]);
+                let mut t1a = t1.clone();
+                let mut t2a = t2.clone();
+                t1a.push(true);
+                t2a.push(false);
+                todo.push((i + 1, t1a, j, t2a));
+                t1.push(false);
+                t2.push(true);
+                todo.push((i, t1, j + 1, t2));
+            }
+        }
+        res
     }
 
-    fn div(&self, small: &Thin) -> Thin {
-        //! self.comp(output) = small  if small <= self
-        //! self :   ctxn -> ctxm
-        //! small :  ctxn -> ctxk
-        //! output : ctxm -> ctxk
-        assert_eq!(self.dom(), small.dom());
+    /*
+    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
+        /*
 
-        assert!(
-            self.is_ge(small),
-            "The small thinning should be a sub thinning of the bigger one (self)"
-        ); // small <= self
-        Thin(
-            zip(self.0.iter(), small.0.iter())
-                .filter(|(_, b)| **b)
-                .map(|(a, _)| *a)
-                .collect(),
-        )
+        */
+        assert_eq!(self.cod(), other.cod());
+        assert!(self.dom() >= other.dom());
+        let N = self.dom() - self.cod();
+        let k = other.dom() - other.cod();
+        // all 1010101 strings with extras 1 digits. N choose k
+
+        let res = vec![];
+        let res = vec![(0, vec![])];
+        for b in self.0 {}
+    }
+    */
+    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
+        assert_eq!(self.cod(), other.cod());
+
+        let mut partials = vec![(0, Vec::with_capacity(self.dom()))];
+        for &target in &self.0 {
+            let mut next = Vec::new();
+            for (j, bits) in partials {
+                if !target {
+                    let mut skip = bits.clone();
+                    skip.push(false);
+                    next.push((j, skip));
+                }
+
+                if j < other.dom() && other.0[j] == target {
+                    let mut take = bits;
+                    take.push(true);
+                    next.push((j + 1, take));
+                }
+            }
+            partials = next;
+        }
+
+        let res = partials
+            .into_iter()
+            .filter_map(|(j, bits)| (j == other.dom()).then_some(Thin(bits)))
+            .collect::<Vec<_>>();
+        debug_assert!(res.iter().all(|t| t.comp(other) == *self));
+        res
     }
 }
 
@@ -216,9 +272,12 @@ fn common_minctx<T: Eq + Clone + Debug>(
     assert_eq!(minctx.len(), wide2.len());
     (minctx, Thin(wide1), Thin(wide2))
 }
+
+type RawId = usize;
+
 /// An Id is the combo of a raw usize identifier and a thinning. This allows lifting an object into a weaker context without having to reintern it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Id(Thin, usize);
+pub struct Id(Thin, RawId);
 // Possibly Var could be factored to be a case in this enum. Eh. The convention that id = 0 is var seems fine.
 // enum Id { EId(Thin, usize), Var} but Var might still need to be thinng. Id = (Thin, Option<usize) ?
 impl Id {
@@ -297,9 +356,10 @@ type TermInCtx = (Vec<String>, Term);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Node {
     App(Id, Id),
-    Lam(Id),
+    Lam { var_used: bool, rawid: RawId },
+    //Lam(Id), // Lam(var_used:bool, rawid : usize)
     Var,
-    Lit(String), // Symbol? Constant
+    Lit(String), // Symbol? Constant.
     // Value(Value)
     UNode(Id, Id), // Maybe rawid because everything in eclass has same minimal context. No. rawid are terms which have a very concrete
 }
@@ -309,16 +369,13 @@ pub struct EGraph {
     memo: HashMap<Node, Id>,
     nodes: Vec<Node>,
     uf: Vec<Id>,
+    minctx: Vec<usize>,
 }
 pub fn varid() -> Id {
     Id(Thin::id(1), 0)
 }
 
-type UserId = (Vec<String>, Id); // UserId = (Vec<String>, usize)
-
-/*
-struct UserId { maxctx : Vec<String>, needed : thin, rawid : usize}
-*/
+type UserId = (Vec<String>, Id);
 
 impl EGraph {
     pub fn new() -> Self {
@@ -328,6 +385,7 @@ impl EGraph {
             memo,
             nodes: vec![Node::Var],
             uf: vec![varid()],
+            minctx: vec![1],
         }
     }
 
@@ -339,6 +397,7 @@ impl EGraph {
             self.uf.push(id.clone());
             self.nodes.push(n.clone());
             self.memo.insert(n, id.clone());
+            self.minctx.push(ctx);
             id
         }
     }
@@ -397,12 +456,21 @@ impl EGraph {
     }
 
     fn lam(&mut self, body: Id) -> Id {
-        assert!(body.ctx() != 0);
-        // body bigctx HAS to have the bound var in it [],
+        assert!(
+            body.ctx() != 0,
+            "Body should have at least one variable in its context"
+        );
         let body = self.find(&body);
         let thin = body.0.dump0(); // the scope of the lambda is the minctx of the "body.remove(0)", since it hsouldn't matter if body used var or not.
         // Also here. Everything in body should be true except _possibly_ the first value.
-        let id = self.add_node(thin.cod(), Node::Lam(body.clone()));
+        // TODO: No. This is wrong. I need to dump, then work in the smallest. Id(Thin::id(thin.cod()), body.1)
+        let id = self.add_node(
+            thin.cod(),
+            Node::Lam {
+                var_used: body.0.0[0],
+                rawid: body.1,
+            },
+        );
         id.weaken(&thin) // I'm just composing an identity with a thinning. seems wasteful
     }
 
@@ -437,7 +505,7 @@ impl EGraph {
             false
         }
         /*
-        // TODO: We can avoid making a new rawid in many cases (?)
+        // TODO: We can avoid making a new rawid in many cases (?) But unodes?
         else if a.0 == b.0 && a.0.is_id() {
             self.uf[a.1] =
         }
@@ -447,16 +515,10 @@ impl EGraph {
         }*/
         else {
             let (common, proj_a, proj_b) = Thin::meet(&a.0, &b.0);
-            //let thin = a.0.lcm(&b.0); // bitwise and
-            // This makes no sense. Should I just me using join here?
             let Id(_, rawz) = self.add_node(
                 common.cod(),
                 Node::UNode(Id(proj_a.clone(), a.1), Id(proj_b.clone(), b.1)),
-            ); //Node::UNode(a.clone(), b.clone()));
-            //let rawz = self.makeset(a.ctx()); // Hmm. Maybe this is wrong. I don't want nodes and uf out of sync. Maybe UNode is appropriate
-            // Actually unodes are essential for enumeration, because the annotations are tree structured.
-            // We actually need to insert carefully into unode tree? no, maybe not.
-            // So the monus heap shows up as the enumerator?
+            );
             self.uf[a.1] = Id(proj_a, rawz);
             self.uf[b.1] = Id(proj_b, rawz);
             true
@@ -466,6 +528,15 @@ impl EGraph {
     pub fn named_union(&mut self, ctx: &[String], a: UserId, b: UserId) -> bool {
         let (minctx, thina, thinb) = common_minctx(ctx, &a.0, &b.0);
         self.union(&a.1.weaken(&thina), &b.1.weaken(&thinb))
+    }
+
+    pub fn named_union0(&mut self, a: UserId, b: UserId) -> Option<bool> {
+        // Result.
+        if a.0 == b.0 {
+            Some(self.union(&a.1, &b.1))
+        } else {
+            None
+        }
     }
 
     pub fn rebuild(&mut self) {
@@ -478,9 +549,10 @@ impl EGraph {
                     Node::Lit(_) => {}
                     Node::Var => {}
                     Node::UNode(_, _) => {}
-                    Node::Lam(body) => {
-                        let id1 = self.lam(id.clone());
-                        done &= !self.union(&id, &id1);
+                    Node::Lam { var_used, rawid } => {
+                        panic!("unimplemented");
+                        //let id1 = self.lam(Id(, rawid));
+                        //done &= !self.union(&id, &id1);
                     }
                     Node::App(f, x) => {
                         let id1 = self.app(f.clone(), x.clone());
@@ -494,40 +566,27 @@ impl EGraph {
         }
     }
 
-    /*
-    fn rebuild(&mut self) {
-        for node in self.nodes.iter() {
-            match node {
-                Node::App(f, x) => {
-                    let fid = self.find(f);
-                    let xid = self.find(x);
-                    let id = self.app(fid, xid);
-                    self.union(id1, id);
-                }
-            }
-        }
-    }
-    */
-
-    pub fn nodes_in_class_no_find(&self, id: &Id) -> Vec<Id> {
+    pub fn nodes_in_class_no_find(&self, id: &Id) -> Vec<(Thin, usize)> {
         // Is it worth making this an Iterator instead of returning Vec?
         //let Id(thin, rawid) = self.find(id);
         let mut res = vec![];
-        let mut todo = vec![id.clone()];
-        while let Some(id) = todo.pop() {
-            match &self.nodes[id.1] {
+        let mut todo = vec![(Thin::id(id.minctx()), id.1)];
+        //let orig_thin = id.0.clone();
+        while let Some((thin, rawid)) = todo.pop() {
+            match &self.nodes[rawid] {
                 Node::UNode(a, b) => {
-                    let thin = id.0;
-                    todo.push(a.weaken(&thin));
-                    todo.push(b.weaken(&thin));
+                    dbg!(&thin, &a);
+                    todo.push((thin.comp(&a.0), a.1)); // This composition is in the opposite direction of weakening
+                    dbg!(&thin, &b);
+                    todo.push((thin.comp(&b.0), b.1));
                 }
-                _ => res.push(id),
+                _ => res.push((thin, rawid)),
             }
         }
         res
     }
 
-    pub fn nodes_in_class(&self, id: &Id) -> Vec<Id> {
+    pub fn nodes_in_class(&self, id: &Id) -> Vec<(Thin, usize)> {
         self.nodes_in_class_no_find(&self.find(id))
     }
     /*
@@ -582,6 +641,7 @@ impl EGraph {
     }
 
     pub fn add_term(&mut self, ctx: &[String], t: Term) -> UserId {
+        // Make Result.
         let (minctx, id) = self.add_term_helper(ctx, t);
         let thin = is_subseq(ctx, &minctx).unwrap();
         (ctx.to_vec(), id.weaken(&thin))
@@ -599,6 +659,46 @@ mod tests {
         assert!(&Thin::id(3).comp(&t1) == &t1);
         assert!(&t1.comp(&Thin::id(2)) == &t1);
     }
+
+    #[test]
+    fn test_all_comm_triangles_no_extra_holes() {
+        let self_ = Thin(vec![true, false, true]);
+        let other = Thin(vec![true, true]);
+
+        let triangles = self_.all_comm_triangles(&other);
+
+        assert_eq!(triangles, vec![self_.clone()]);
+        assert!(triangles.iter().all(|t| t.comp(&other) == self_));
+    }
+
+    #[test]
+    fn test_all_comm_triangles_choose_one_extra_hole() {
+        let self_ = Thin(vec![true, false, true, false]);
+        let other = Thin(vec![true, false, true]);
+
+        let mut triangles = self_.all_comm_triangles(&other);
+        triangles.sort_by_key(|t| t.0.clone());
+
+        assert_eq!(triangles, vec![Thin(vec![true, true, true, false])]);
+        assert!(triangles.iter().all(|t| t.comp(&other) == self_));
+    }
+
+    #[test]
+    fn test_all_comm_triangles_choose_two_extra_holes() {
+        let self_ = Thin(vec![true, false, false, false, true]);
+        let other = Thin(vec![true, false, false, true]);
+
+        let triangles = self_.all_comm_triangles(&other);
+
+        assert_eq!(triangles.len(), 3);
+        assert!(triangles.iter().all(|t| t.dom() == self_.dom()));
+        assert!(triangles.iter().all(|t| t.cod() == other.dom()));
+        assert!(triangles.iter().all(|t| t.comp(&other) == self_));
+        assert!(triangles.contains(&Thin(vec![true, true, false, true, true])));
+        assert!(triangles.contains(&Thin(vec![true, true, true, false, true])));
+        assert!(triangles.contains(&Thin(vec![true, false, true, true, true])));
+    }
+
     #[test]
     fn test_egraph() {
         let mut g = EGraph::new();
@@ -747,6 +847,8 @@ mod tests {
 
         assert_eq!(zero1, zero2);
 
+        //assert_eq!(g.nodes_in_class(&zero2.1).len(), 2);
+
         // Or is this just wrong. We should never be calling app on something that has
         // Widening should commute with app  app(f,x).wide() == app(f.wide(), x.wide())
         // It should also commute with lam.
@@ -766,6 +868,60 @@ mod tests {
 }
 
 /*
+
+
+    /*
+    let obj = zip(self.0.iter(), other.0.iter())
+        .filter(|(a, b)| **a && **b)
+        .count();
+    let proj_self = zip(self.0.iter(), other.0.iter())
+        .filter_map(|(a, b)| if *a { Some(*b) } else { None })
+        .collect();
+    let proj_other = zip(self.0.iter(), other.0.iter())
+        .filter_map(|(a, b)| if *b { Some(*a) } else { None })
+        .collect();
+
+    (obj, Thin(proj_self), Thin(proj_other))
+    */
+
+// UserId = (Vec<String>, usize)
+/*
+struct UserId { maxctx : Vec<String>, needed : thin, rawid : usize}
+*/
+            //let rawz = self.makeset(a.ctx()); // Hmm. Maybe this is wrong. I don't want nodes and uf out of sync. Maybe UNode is appropriate
+            // Actually unodes are essential for enumeration, because the annotations are tree structured.
+            // We actually need to insert carefully into unode tree? no, maybe not.
+            // So the monus heap shows up as the enumerator?
+
+    // TODO remove.
+    pub fn bitor(&self, other: &Thin) -> Thin {
+        //! bitwise or. Useful for computing the needed context of a node from its children.
+        assert_eq!(self.dom(), other.dom());
+        Thin(
+            zip(self.0.iter(), other.0.iter())
+                .map(|(x, y)| *x || *y)
+                .collect(),
+        )
+    }
+
+    fn div(&self, small: &Thin) -> Thin {
+        //! self.comp(output) = small  if small <= self
+        //! self :   ctxn -> ctxm
+        //! small :  ctxn -> ctxk
+        //! output : ctxm -> ctxk
+        assert_eq!(self.dom(), small.dom());
+
+        assert!(
+            self.is_ge(small),
+            "The small thinning should be a sub thinning of the bigger one (self)"
+        ); // small <= self
+        Thin(
+            zip(self.0.iter(), small.0.iter())
+                .filter(|(_, b)| **b)
+                .map(|(a, _)| *a)
+                .collect(),
+        )
+    }
 
         /*
         lam x, 5
