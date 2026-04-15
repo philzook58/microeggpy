@@ -1,13 +1,18 @@
 use std::collections::HashMap;
-use std::fmt::Display;
 pub type Id = usize;
 
 type Name = String;
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
-pub struct Node {
-    pub f: Name,
-    pub args: Vec<Id>,
-} // | FixVar()
+pub enum Node {
+    App { f: Name, args: Vec<Id> }, // is_constr / is_guard / is_productive : bool
+    FixVar { body: Id },
+}
+/*
+Slotted and Thinning have their own Var constructor. Hmm.
+FixVar is enough of a blocker that the new thing and it's body are not exactly automatically identified. Just Fix()?
+
+App(), Lit(), FixVar(Id), Constr(f : String, args : Vec<Id>
+*/
 
 #[derive(Default)]
 pub struct EGraph {
@@ -45,7 +50,7 @@ impl EGraph {
             Term::Var(name) => subst[name],
             Term::App(f, args) => {
                 let args = args.iter().map(|arg| self.add_term(arg, subst)).collect();
-                self.add_node(Node { f: f.into(), args })
+                self.add_node(Node::App { f: f.into(), args })
             }
         }
     }
@@ -65,9 +70,23 @@ impl EGraph {
     }
 
     // fn make_defn(&mut self, body) {} // ? fix? make_defn(&mut self, name, body)
+    fn fix(&mut self, name: Name, body: &Term) -> Id {
+        let node = Node::FixVar {
+            body: self.uf.len(),
+        };
+        let id = self.add_node(node.clone());
+        let mut subst = HashMap::new();
+        subst.insert(name, id);
+        let body = self.add_term(body, &subst);
+        self.nodes[id] = Node::FixVar { body };
+        self.memo.remove(&node);
+        self.memo.insert(Node::FixVar { body }, id);
+        // Or is the flimflam too cute?
+        id
+    }
 
     pub fn add(&mut self, f: &str, args: Vec<Id>) -> Id {
-        let node = Node {
+        let node = Node::App {
             f: f.into(),
             args: args.into(),
         };
@@ -86,6 +105,7 @@ impl EGraph {
             self.sibling[b] = a_next;
         }
     }
+    // Tie break to constructor?
 
     pub fn find(&self, mut a: Id) -> Id {
         while self.uf[a] != a {
@@ -99,9 +119,14 @@ impl EGraph {
     }
 
     pub fn canonicalize_node(&self, node: &Node) -> Node {
-        Node {
-            f: node.f.clone(),
-            args: node.args.iter().map(|id| self.find(*id)).collect(),
+        match node {
+            Node::App { f, args } => Node::App {
+                f: f.clone(),
+                args: args.iter().map(|id| self.find(*id)).collect(),
+            },
+            Node::FixVar { body } => Node::FixVar {
+                body: self.find(*body),
+            },
         }
     }
 
@@ -131,13 +156,14 @@ impl EGraph {
         let mut egraph = EGraph::default();
         let mut root_map = HashMap::new();
         for (id, node) in self.nodes.iter().enumerate() {
-            let new_node = Node {
-                f: node.f.clone(),
-                args: node
-                    .args
-                    .iter()
-                    .map(|id| root_map[&self.find(*id)])
-                    .collect(),
+            let new_node = match node {
+                Node::App { f, args } => Node::App {
+                    f: f.clone(),
+                    args: args.iter().map(|id| root_map[&self.find(*id)]).collect(),
+                },
+                Node::FixVar { body } => panic!(
+                    "hmm this is tough actually because we can't count on this already being there."
+                ),
             };
             let id2 = egraph.add_node(new_node);
             let id = self.find(id);
@@ -167,19 +193,28 @@ impl EGraph {
                     return vec![subst];
                 }
             }
-            Term::App(f, args) => {
+            Term::App(pf, pargs) => {
                 let mut results = vec![];
                 for node in self.nodes_in_class(class) {
-                    if node.f == *f && node.args.len() == args.len() {
-                        let mut todo = vec![subst.clone()];
-                        for (pa, na) in args.iter().zip(node.args.iter()) {
-                            todo = todo
-                                .into_iter()
-                                .flat_map(|subst| self.ematch_rec(depth + 1, pa, *na, subst))
-                                .collect();
-                        }
+                    match node {
+                        Node::App { f, args } => {
+                            if f == pf && pargs.len() == args.len() {
+                                let mut todo = vec![subst.clone()];
+                                for (pa, na) in pargs.iter().zip(args.iter()) {
+                                    todo = todo
+                                        .into_iter()
+                                        .flat_map(|subst| {
+                                            self.ematch_rec(depth + 1, pa, *na, subst)
+                                        })
+                                        .collect();
+                                }
 
-                        results.extend(todo);
+                                results.extend(todo);
+                            }
+                        }
+                        Node::FixVar { body } => {
+                            results.extend(self.ematch_rec(depth, pat, *body, subst.clone()));
+                        }
                     }
                 }
                 results
@@ -222,19 +257,19 @@ impl EGraph {
 
             let best = egraph
                 .nodes_in_class(class)
-                .filter_map(|node| {
-                    let arg_costs: Option<Vec<_>> = node
-                        .args
-                        .iter()
-                        .map(|&arg| worker(egraph, cost, arg))
-                        .collect();
-                    let arg_costs = arg_costs?;
-                    let total_cost = 1 + arg_costs
-                        .iter()
-                        .map(|(node_cost, _)| *node_cost)
-                        .sum::<usize>();
-                    let args = arg_costs.into_iter().map(|(_, term)| term).collect();
-                    Some((total_cost, Term::App(node.f.clone(), args)))
+                .filter_map(|node| match node {
+                    Node::App { f, args } => {
+                        let arg_costs: Option<Vec<_>> =
+                            args.iter().map(|&arg| worker(egraph, cost, arg)).collect();
+                        let arg_costs = arg_costs?;
+                        let total_cost = 1 + arg_costs
+                            .iter()
+                            .map(|(node_cost, _)| *node_cost)
+                            .sum::<usize>();
+                        let args = arg_costs.into_iter().map(|(_, term)| term).collect();
+                        Some((total_cost, Term::App(f.clone(), args)))
+                    }
+                    Node::FixVar { body } => panic!("unpimplemed"),
                 })
                 .min_by_key(|(node_cost, _)| *node_cost);
 
