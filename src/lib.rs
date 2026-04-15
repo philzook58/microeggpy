@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+mod coegraph;
 pub mod thin;
 pub mod uf;
 

@@ -9,6 +9,7 @@ pub struct Thin(Vec<bool>); // TODO: swtich to bitvec. smallbitvec, or smallvec,
 
 impl Thin {
     //! Thinnings are mappings between contexts represented as bitvectors. true means keep, false means drop.
+    //! They can also be thought of as liftings of functions by adding unused arguments
     //! [x,y,z].thin([true,false,true]) => [x,z]
     //! [x,z].widen([true,false,true]) => [x,_,z]
     //! https://www.philipzucker.com/thin1/
@@ -52,13 +53,16 @@ impl Thin {
         Thin(res)
     }
 
+    //pub fn comp_mut(&mut self, other : &Thin){
+    //}
+
     pub fn meet(&self, other: &Thin) -> (Thin, Thin, Thin) {
         //! widest_common_subthinning
         //! meet
         //! Compute the bitwise and widest common thinning and how to get there.
         //! self.comp(out.1) = other.comp(out.2)
         //! Pullback?
-        assert_eq!(self.dom(), other.dom());
+        debug_assert_eq!(self.dom(), other.dom());
         // Should I just do the dumb loop?
         let mut common = Vec::with_capacity(self.dom());
         let mut proj_self = vec![];
@@ -82,7 +86,7 @@ impl Thin {
         //! bitwise or
         // pushout?
         // common prefix
-        assert_eq!(self.dom(), other.dom());
+        debug_assert_eq!(self.dom(), other.dom());
         let mut prefix = Vec::with_capacity(self.dom());
         let mut proj_self = vec![];
         let mut proj_other = vec![];
@@ -99,82 +103,20 @@ impl Thin {
     fn is_ge(&self, other: &Thin) -> bool {
         //! Is self a subthinning of other? I.e. is there a thinning from self to other?
         //! Proof relevant version would return the thinning that does it. Does there exists t, such that self . t = other
-        assert_eq!(self.dom(), other.dom());
+        debug_assert_eq!(self.dom(), other.dom());
         zip(self.0.iter(), other.0.iter()).all(|(a, b)| !*a || *b)
     }
 
-    fn all_comm_squares(&self, other: &Thin) -> Vec<(Thin, Thin)> {
-        // Its not _all_ of them but it is the non tivial ones that form a frontier.
-        assert_eq!(self.cod(), other.cod());
-        let self_ = &self.0;
-        let other = &other.0;
-        let mut todo = vec![(0, vec![], 0, vec![])];
-        let mut res = vec![];
-        while let Some((mut i, mut t1, mut j, mut t2)) = todo.pop() {
-            while (i < self_.len() && self_[i]) || (j <= other.len() && other[j]) {
-                if self_[i] && other[j] {
-                    // Both take pinned value
-                    t1.push(true);
-                    t2.push(true);
-                    i += 1;
-                    j += 1;
-                } else if self_[i] {
-                    // have to take other to get back in sync to true true
-                    // No we can still have true true true happen.
-                    j += 1;
-                    t1.push(false);
-                    t2.push(true);
-                    // No we can also take
-                } else if other[j] {
-                    // have to take self to get back in sync
-                    i += 1;
-                    t1.push(true);
-                    t2.push(false);
-                }
-            }
-            if i == self.0.len() && j == other.len() {
-                let t1 = Thin(t1);
-                let t2 = Thin(t2);
-                assert_eq!(t1.dom(), t2.dom());
-                assert_eq!(t1.cod(), self_.len());
-                assert_eq!(t2.cod(), other.len());
-                res.push((t1, t2))
+    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
+        debug_assert_eq!(self.cod(), other.cod());
+        if self.dom() <= other.dom() {
+            if self == other {
+                return vec![self.clone()];
             } else {
-                // both false. Need to try both orderings
-                assert!(!self_[i]);
-                assert!(!other[j]);
-                let mut t1a = t1.clone();
-                let mut t2a = t2.clone();
-                t1a.push(true);
-                t2a.push(false);
-                todo.push((i + 1, t1a, j, t2a));
-                t1.push(false);
-                t2.push(true);
-                todo.push((i, t1, j + 1, t2));
+                return vec![];
             }
         }
-        res
-    }
-
-    /*
-    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
-        /*
-
-        */
-        assert_eq!(self.cod(), other.cod());
-        assert!(self.dom() >= other.dom());
-        let N = self.dom() - self.cod();
-        let k = other.dom() - other.cod();
-        // all 1010101 strings with extras 1 digits. N choose k
-
-        let res = vec![];
-        let res = vec![(0, vec![])];
-        for b in self.0 {}
-    }
-    */
-    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
-        assert_eq!(self.cod(), other.cod());
-
+        // tuple of how far along in other and current prefix
         let mut partials = vec![(0, Vec::with_capacity(self.dom()))];
         for &target in &self.0 {
             let mut next = Vec::new();
@@ -203,76 +145,79 @@ impl Thin {
     }
 }
 
-mod named {}
+mod named {
+    use super::Debug;
+    use super::Thin;
+    use super::zip;
 
-// Working with named contexts
-pub fn is_subseq<T: Eq>(big: &[T], small: &[T]) -> Option<Thin> {
-    //! Compute the thinning witness of extracting small from big if it exists.
-    let mut res = Vec::with_capacity(big.len());
-    let mut j = 0;
-    for i in big.iter() {
-        if j < small.len() && i == &small[j] {
-            res.push(true);
-            j += 1;
+    // Working with named contexts
+    pub fn is_subseq<T: Eq>(big: &[T], small: &[T]) -> Option<Thin> {
+        //! Compute the thinning witness of extracting small from big if it exists.
+        let mut res = Vec::with_capacity(big.len());
+        let mut j = 0;
+        for i in big.iter() {
+            if j < small.len() && i == &small[j] {
+                res.push(true);
+                j += 1;
+            } else {
+                res.push(false);
+            }
+        }
+        if j == small.len() {
+            Some(Thin(res))
         } else {
-            res.push(false);
+            None
         }
     }
-    if j == small.len() {
-        Some(Thin(res))
-    } else {
-        None
+
+    pub fn apply_thin<T: Clone>(thin: &Thin, big: &[T]) -> Vec<T> {
+        //! Apply a thinning to a big context to get the small context.
+        assert_eq!(thin.dom(), big.len());
+        zip(thin.0.iter(), big.iter())
+            .filter(|(b, _)| **b)
+            .map(|(_, x)| x.clone())
+            .collect()
+    }
+
+    // This is the named version of pullback?
+    pub fn common_minctx<T: Eq + Clone + Debug>(
+        big: &[T],
+        small1: &[T],
+        small2: &[T],
+    ) -> (Vec<T>, Thin, Thin) {
+        //! From a maximal context and two needed contexts, find the smallest combo context and thinnning
+        //! small1 = thin @ minctx
+        //! small2 = thin @ minctx
+        //! maxctx is needed to know how to interleave small1 and small2
+        // assert!(is_subseq(big, small1).is_some() && is_subseq(big, small2).is_some()); // I guess the end check is also doing this
+        let mut wide1 = vec![];
+        let mut wide2 = vec![];
+        let mut minctx: Vec<T> = vec![];
+        let mut n1 = 0;
+        let mut n2 = 0;
+        // Reconcile the two minimal contexts. A sorted union
+        for s in big.iter() {
+            let take1 = n1 < small1.len() && small1[n1] == *s;
+            let take2 = n2 < small2.len() && small2[n2] == *s;
+            if take1 {
+                n1 += 1;
+            }
+            if take2 {
+                n2 += 1;
+            }
+            if take1 || take2 {
+                minctx.push(s.clone());
+                wide1.push(take1);
+                wide2.push(take2);
+            }
+        }
+        assert_eq!(n1, small1.len());
+        assert_eq!(n2, small2.len());
+        assert_eq!(minctx.len(), wide1.len());
+        assert_eq!(minctx.len(), wide2.len());
+        (minctx, Thin(wide1), Thin(wide2))
     }
 }
-
-fn apply_thin<T: Clone>(thin: &Thin, big: &[T]) -> Vec<T> {
-    //! Apply a thinning to a big context to get the small context.
-    assert_eq!(thin.dom(), big.len());
-    zip(thin.0.iter(), big.iter())
-        .filter(|(b, _)| **b)
-        .map(|(_, x)| x.clone())
-        .collect()
-}
-
-// This is the named version of pullback?
-fn common_minctx<T: Eq + Clone + Debug>(
-    big: &[T],
-    small1: &[T],
-    small2: &[T],
-) -> (Vec<T>, Thin, Thin) {
-    //! From a maximal context and two needed contexts, find the smallest combo context and thinnning
-    //! small1 = thin @ minctx
-    //! small2 = thin @ minctx
-    //! maxctx is needed to know how to interleave small1 and small2
-    // assert!(is_subseq(big, small1).is_some() && is_subseq(big, small2).is_some()); // I guess the end check is also doing this
-    let mut wide1 = vec![];
-    let mut wide2 = vec![];
-    let mut minctx: Vec<T> = vec![];
-    let mut n1 = 0;
-    let mut n2 = 0;
-    // Reconcile the two minimal contexts. A sorted union
-    for s in big.iter() {
-        let take1 = n1 < small1.len() && small1[n1] == *s;
-        let take2 = n2 < small2.len() && small2[n2] == *s;
-        if take1 {
-            n1 += 1;
-        }
-        if take2 {
-            n2 += 1;
-        }
-        if take1 || take2 {
-            minctx.push(s.clone());
-            wide1.push(take1);
-            wide2.push(take2);
-        }
-    }
-    assert_eq!(n1, small1.len());
-    assert_eq!(n2, small2.len());
-    assert_eq!(minctx.len(), wide1.len());
-    assert_eq!(minctx.len(), wide2.len());
-    (minctx, Thin(wide1), Thin(wide2))
-}
-
 type RawId = usize;
 
 /// An Id is the combo of a raw usize identifier and a thinning. This allows lifting an object into a weaker context without having to reintern it.
@@ -303,26 +248,18 @@ impl Id {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-struct MinId {
-    ctx: usize,
-    rawid: usize,
-} // An Id that has an implicit Id thinning of size ctx
-// TODO: I should possibly have
-
 /// An ordinary syntax tree for user readability. Using the raw api is very painful and error prone.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum Term {
     Var(String),
     App(Box<Term>, Box<Term>),
-    Lam(String, Box<Term>),
+    //Lam(String, Box<Term>),
     Lit(String),
     EId(Id), // Do I want Vec<String> here? Or does the Id narrow from the full context. But I might not even know
              // PVar(String, Vec<String>) Miller pattern var
              // Drop(String, Box<Term>) explicitly say a variable is dropped. For weakening to an Id? Or for weakening to pattern variable, which then always captures everything
              // Kind of the converse of Lam.
 }
-type Pattern = (usize, Term); // first n variables are pattern variables.
 
 impl Term {
     pub fn var(v: &str) -> Self {
@@ -343,9 +280,9 @@ impl Term {
             Box::new(z),
         )
     }
-    pub fn lam(v: &str, body: Term) -> Self {
-        Term::Lam(v.to_string(), Box::new(body))
-    }
+    //pub fn lam(v: &str, body: Term) -> Self {
+    //    Term::Lam(v.to_string(), Box::new(body))
+    //}
     pub fn lit(s: &str) -> Self {
         Term::Lit(s.to_string())
     }
@@ -356,7 +293,7 @@ type TermInCtx = (Vec<String>, Term);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Node {
     App(Id, Id),
-    Lam { var_used: bool, rawid: RawId },
+    // Lam { var_used: bool, rawid: RawId },
     //Lam(Id), // Lam(var_used:bool, rawid : usize)
     Var,
     Lit(String), // Symbol? Constant.
@@ -455,6 +392,7 @@ impl EGraph {
         self.add_node(0, Node::Lit(s))
     }
 
+    /*
     fn lam(&mut self, body: Id) -> Id {
         assert!(
             body.ctx() != 0,
@@ -473,6 +411,7 @@ impl EGraph {
         );
         id.weaken(&thin) // I'm just composing an identity with a thinning. seems wasteful
     }
+    */
 
     pub fn find(&self, id: &Id) -> Id {
         let Id(mut thin, mut rawid) = id.clone();
@@ -490,7 +429,7 @@ impl EGraph {
 
     pub fn named_find(&self, nid: &UserId) -> UserId {
         let id = self.find(&nid.1);
-        (apply_thin(&id.0, &nid.0), id)
+        (named::apply_thin(&id.0, &nid.0), id)
     }
     pub fn is_eq(&mut self, a: &Id, b: &Id) -> bool {
         self.find(a) == self.find(b)
@@ -526,7 +465,7 @@ impl EGraph {
     }
 
     pub fn named_union(&mut self, ctx: &[String], a: UserId, b: UserId) -> bool {
-        let (minctx, thina, thinb) = common_minctx(ctx, &a.0, &b.0);
+        let (minctx, thina, thinb) = named::common_minctx(ctx, &a.0, &b.0);
         self.union(&a.1.weaken(&thina), &b.1.weaken(&thinb))
     }
 
@@ -549,11 +488,12 @@ impl EGraph {
                     Node::Lit(_) => {}
                     Node::Var => {}
                     Node::UNode(_, _) => {}
+                    /*
                     Node::Lam { var_used, rawid } => {
                         panic!("unimplemented");
                         //let id1 = self.lam(Id(, rawid));
                         //done &= !self.union(&id, &id1);
-                    }
+                    } */
                     Node::App(f, x) => {
                         let id1 = self.app(f.clone(), x.clone());
                         done &= !self.union(&id, &id1);
@@ -566,29 +506,58 @@ impl EGraph {
         }
     }
 
-    pub fn nodes_in_class_no_find(&self, id: &Id) -> Vec<(Thin, usize)> {
-        // Is it worth making this an Iterator instead of returning Vec?
-        //let Id(thin, rawid) = self.find(id);
+    // I maybe suspect this should just be what happens when you hit a unode in ematching.
+
+    fn all_liftable_node_ids(&self, id0: &Id) -> Vec<Id> {
+        /*
+        We find to rawid with smallest minctx and seek out all rawids that can be lifted into the requested context
+        We then ave to reconcile all the ways there other thing may have to be fit into the larger context
+        */
+        let id0 = self.find(id0);
         let mut res = vec![];
-        let mut todo = vec![(Thin::id(id.minctx()), id.1)];
-        //let orig_thin = id.0.clone();
-        while let Some((thin, rawid)) = todo.pop() {
+        let ctx = id0.ctx();
+        let thin0 = id0.0;
+        let mut todo = vec![Id(Thin::id(thin0.cod()), id0.1)];
+        while let Some(Id(thin, rawid)) = todo.pop() {
             match &self.nodes[rawid] {
                 Node::UNode(a, b) => {
-                    dbg!(&thin, &a);
-                    todo.push((thin.comp(&a.0), a.1)); // This composition is in the opposite direction of weakening
-                    dbg!(&thin, &b);
-                    todo.push((thin.comp(&b.0), b.1));
+                    if a.ctx() <= ctx {
+                        todo.push(Id(a.0.comp(&thin), a.1)); // This composition is in the opposite direction of weakening
+                    }
+                    if b.ctx() <= ctx {
+                        todo.push(Id(b.0.comp(&thin), b.1));
+                    }
                 }
-                _ => res.push((thin, rawid)),
+                _ => res.extend(
+                    thin0
+                        .all_comm_triangles(&thin)
+                        .into_iter()
+                        .map(|thin1| Id(thin1, rawid)),
+                ),
             }
         }
         res
     }
 
-    pub fn nodes_in_class(&self, id: &Id) -> Vec<(Thin, usize)> {
-        self.nodes_in_class_no_find(&self.find(id))
+    fn ematch(&self, pat: &Term, id: &Id) -> Vec<()> {
+        let res = vec![];
+        for id1 in self.all_liftable_node_ids(id) {
+            let node = &self.nodes[id1.1];
+            match (pat, node) {
+                (Term::App(f, x), Node::App(f1, x1)) => {}
+                //(Term::Lam(v, body), Node::Lam { var_used, rawid }) => {}
+                (Term::Lit(l), Node::Lit(l1)) => {}
+                (Term::Var(v), Node::Var) => {}
+                (_, _) => {} // Term::EId(id1), _ =>
+            }
+        }
+        res
     }
+
+    /*
+    In minimal version ignore lambda?
+    */
+
     /*
     What I've done to ids is too funky. Now ids
      */
@@ -610,10 +579,11 @@ impl EGraph {
             Term::App(f, x) => {
                 let (fctx, fid) = self.add_term_helper(maxctx, *f);
                 let (xctx, xid) = self.add_term_helper(maxctx, *x);
-                let (minctx, widef, widex) = common_minctx(maxctx, &fctx, &xctx);
+                let (minctx, widef, widex) = named::common_minctx(maxctx, &fctx, &xctx);
                 // Hmm. What if add_node returns less than I thought? I should thin minctx
                 (minctx, self.app(fid.weaken(&widef), xid.weaken(&widex)))
             }
+            /*
             Term::Lam(v, body) => {
                 // Search for shadowed x and remove it
                 let mut bodymaxctx = maxctx.to_vec();
@@ -632,10 +602,11 @@ impl EGraph {
                 }
                 (bodyminctx, self.lam(bid))
             }
+            */
             Term::EId(id) => {
                 assert!(id.ctx() <= maxctx.len());
                 //  = is_ssubseq(maxctx ,id.1).unwrap()
-                (apply_thin(&id.0, maxctx), id)
+                (named::apply_thin(&id.0, maxctx), id)
             }
         }
     }
@@ -643,7 +614,7 @@ impl EGraph {
     pub fn add_term(&mut self, ctx: &[String], t: Term) -> UserId {
         // Make Result.
         let (minctx, id) = self.add_term_helper(ctx, t);
-        let thin = is_subseq(ctx, &minctx).unwrap();
+        let thin = named::is_subseq(ctx, &minctx).unwrap();
         (ctx.to_vec(), id.weaken(&thin))
     }
 }
@@ -730,6 +701,9 @@ mod tests {
         let ab = g.app(a.clone(), b.clone());
         assert!(ab.ctx() == 0);
 
+        /*
+
+        Add back when we return to lambda
         let (emp, id1) = g.add_term(
             &[],
             Term::Lam("x".to_string(), Box::new(Term::Var("x".to_string()))),
@@ -746,6 +720,7 @@ mod tests {
             &["x".to_string()],
             Term::Lam("y".to_string(), Box::new(Term::Var("x".to_string()))),
         );
+
         assert_eq!(c1.0, vec!["x".to_string()]);
         dbg!("{}", &c1);
         assert_eq!(c1.1.ctx(), 1);
@@ -775,14 +750,15 @@ mod tests {
             const1.1, const2.1,
             "alpha equivalent terms should map to same id"
         );
+        */
 
         let c1 = g.add_term(&[], Term::Lit("c".to_string()));
         let c2 = g.add_term(&[], Term::Lit("c1".to_string()));
         assert!(c1 != c2);
         assert!(!g.is_eq(&c1.1, &c2.1));
-        assert_eq!(g.nodes_in_class(&c1.1).len(), 1);
+        assert_eq!(g.all_liftable_node_ids(&c1.1).len(), 1);
         assert!(g.union(&c1.1, &c2.1));
-        assert_eq!(g.nodes_in_class(&c1.1).len(), 2);
+        assert_eq!(g.all_liftable_node_ids(&c1.1).len(), 2);
         assert!(g.is_eq(&c1.1, &c2.1));
 
         let plusab = g.add_term(
@@ -822,7 +798,7 @@ mod tests {
         assert!(g.is_eq(&plusxy.1, &plusab.1), "Should be equal to plusab");
 
         assert_eq!(
-            g.nodes_in_class(&plusab.1).len(),
+            g.all_liftable_node_ids(&plusab.1).len(),
             2,
             "Should have two nodes in class",
         );
@@ -838,7 +814,6 @@ mod tests {
         // Hmm. unon a different contexts _could_ mean kill. But
         //g.union(&zero.1, &xzero.1);
         g.named_union(&["x".to_string()], zero.clone(), xzero.clone());
-        dbg!(&xzero, &zero, &g.uf);
         let zero1 = g.named_find(&zero);
         assert_eq!(zero1.0.len(), 0);
 
@@ -848,6 +823,7 @@ mod tests {
         assert_eq!(zero1, zero2);
 
         //assert_eq!(g.nodes_in_class(&zero2.1).len(), 2);
+        assert_eq!(g.all_liftable_node_ids(&Id(Thin::id(0), zero.1.1)).len(), 1);
 
         // Or is this just wrong. We should never be calling app on something that has
         // Widening should commute with app  app(f,x).wide() == app(f.wide(), x.wide())
@@ -869,6 +845,126 @@ mod tests {
 
 /*
 
+/*
+            for (thin, rawid) in ids {
+            // Take those that can be raised into id0's context
+            res.extend(
+                id0.0
+                    .all_comm_triangles(&thin)
+                    .into_iter()
+                    .map(|thin1| Id(thin1, rawid)),
+            )
+        }
+     */
+
+    pub fn nodes_in_class_no_find(&self, id: &Id) -> Vec<(Thin, usize)> {
+        // Is it worth making this an Iterator instead of returning Vec?
+        //let Id(thin, rawid) = self.find(id);
+        let mut res = vec![];
+        let ctx = id.ctx();
+        let mut todo = vec![(Thin::id(id.minctx()), id.1)];
+        //let orig_thin = id.0.clone();
+        while let Some((thin, rawid)) = todo.pop() {
+            match &self.nodes[rawid] {
+                Node::UNode(a, b) => {
+                    let thina = a.0.comp(&thin);
+                    //if thina.dom() < ctx {
+                        todo.push((thina, a.1)); // This composition is in the opposite direction of weakening
+                    //}
+                    todo.push((b.0.comp(&thin), b.1));
+                }
+                _ => res.push((thin, rawid)),
+            }
+        }
+        res
+    }
+
+    pub fn nodes_in_class(&self, id: &Id) -> Vec<(Thin, usize)> {
+        self.nodes_in_class_no_find(&self.find(id))
+    }
+
+// type Pattern = (usize, Term); // first n variables are pattern variables.
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+struct MinId {
+    ctx: usize,
+    rawid: usize,
+} // An Id that has an implicit Id thinning of size ctx
+// TODO: I should possibly have
+
+
+    /*
+    fn all_comm_squares(&self, other: &Thin) -> Vec<(Thin, Thin)> {
+        // Its not _all_ of them but it is the non tivial ones that form a frontier.
+        // Needed for bottom up ematching
+        assert_eq!(self.cod(), other.cod());
+        let self_ = &self.0;
+        let other = &other.0;
+        let mut todo = vec![(0, vec![], 0, vec![])];
+        let mut res = vec![];
+        while let Some((mut i, mut t1, mut j, mut t2)) = todo.pop() {
+            while (i < self_.len() && self_[i]) || (j <= other.len() && other[j]) {
+                if self_[i] && other[j] {
+                    // Both take pinned value
+                    t1.push(true);
+                    t2.push(true);
+                    i += 1;
+                    j += 1;
+                } else if self_[i] {
+                    // have to take other to get back in sync to true true
+                    // No we can still have true true true happen.
+                    j += 1;
+                    t1.push(false);
+                    t2.push(true);
+                    // No we can also take
+                } else if other[j] {
+                    // have to take self to get back in sync
+                    i += 1;
+                    t1.push(true);
+                    t2.push(false);
+                }
+            }
+            if i == self.0.len() && j == other.len() {
+                let t1 = Thin(t1);
+                let t2 = Thin(t2);
+                assert_eq!(t1.dom(), t2.dom());
+                assert_eq!(t1.cod(), self_.len());
+                assert_eq!(t2.cod(), other.len());
+                res.push((t1, t2))
+            } else {
+                // both false. Need to try both orderings
+                assert!(!self_[i]);
+                assert!(!other[j]);
+                let mut t1a = t1.clone();
+                let mut t2a = t2.clone();
+                t1a.push(true);
+                t2a.push(false);
+                todo.push((i + 1, t1a, j, t2a));
+                t1.push(false);
+                t2.push(true);
+                todo.push((i, t1, j + 1, t2));
+            }
+        }
+        res
+    }
+    */
+
+    /*
+    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
+        /*
+
+        */
+        assert_eq!(self.cod(), other.cod());
+        assert!(self.dom() >= other.dom());
+        let N = self.dom() - self.cod();
+        let k = other.dom() - other.cod();
+        // all 1010101 strings with extras 1 digits. N choose k
+
+        let res = vec![];
+        let res = vec![(0, vec![])];
+        for b in self.0 {}
+    }
+    */
 
     /*
     let obj = zip(self.0.iter(), other.0.iter())
