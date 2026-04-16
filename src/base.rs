@@ -1,3 +1,4 @@
+// Largely pulled from: https://github.com/mwillsey/microegg/blob/main/src/lib.rs
 use std::collections::HashMap;
 pub type Id = usize;
 
