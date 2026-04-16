@@ -4,15 +4,8 @@ pub type Id = usize;
 type Name = String;
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum Node {
-    App { f: Name, args: Vec<Id> }, // is_constr / is_guard / is_productive : bool
-    FixVar { body: Id },
+    App { f: Name, args: Vec<Id> },
 }
-/*
-Slotted and Thinning have their own Var constructor. Hmm.
-FixVar is enough of a blocker that the new thing and it's body are not exactly automatically identified. Just Fix()?
-
-App(), Lit(), FixVar(Id), Constr(f : String, args : Vec<Id>
-*/
 
 #[derive(Default)]
 pub struct EGraph {
@@ -20,8 +13,6 @@ pub struct EGraph {
     pub nodes: Vec<Node>, // todo Indexmap?
     pub uf: Vec<Id>,
     pub sibling: Vec<Id>,
-    //pub defns: HashMap<Id, Id>,
-    // fixes : HashSet<Id>
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -70,22 +61,6 @@ impl EGraph {
         }
     }
 
-    // fn make_defn(&mut self, body) {} // ? fix? make_defn(&mut self, name, body)
-    fn fix(&mut self, name: Name, body: &Term) -> Id {
-        let node = Node::FixVar {
-            body: self.uf.len(),
-        };
-        let id = self.add_node(node.clone());
-        let mut subst = HashMap::new();
-        subst.insert(name, id);
-        let body = self.add_term(body, &subst);
-        self.nodes[id] = Node::FixVar { body };
-        self.memo.remove(&node);
-        self.memo.insert(Node::FixVar { body }, id);
-        // Or is the flimflam too cute?
-        id
-    }
-
     pub fn app(&mut self, f: &str, args: Vec<Id>) -> Id {
         let node = Node::App {
             f: f.into(),
@@ -106,7 +81,6 @@ impl EGraph {
             self.sibling[b] = a_next;
         }
     }
-    // Tie break to constructor?
 
     pub fn find(&self, mut a: Id) -> Id {
         while self.uf[a] != a {
@@ -125,9 +99,6 @@ impl EGraph {
                 f: f.clone(),
                 args: args.iter().map(|id| self.find(*id)).collect(),
             },
-            Node::FixVar { body } => Node::FixVar {
-                body: self.find(*body),
-            },
         }
     }
 
@@ -135,35 +106,6 @@ impl EGraph {
         // Could track as field in EGraph.
         (0..self.uf.len()).filter(|&id| self.find(id) == id).count()
     }
-
-    /*
-    fn is_bisim_rec(&self, a: Id, b: Id, seen: &mut Vec<(bool, Id, Id)>) -> bool {
-        if a == b {
-            return true;
-        } else if guarded && seen.contains(&(a, b)) {
-          // Hmm. That's not right? We need to record guard points in the seen
-          // and also if contains unguarded we need to fail to avoid 1*a = 1*b loop
-        }
-
-        else {
-            seen.push((a, b));
-            for nodea in seld.nodes_in_class(a) {
-                for nodeb in self.nodes_in_class(b) {}
-            }
-            seen.pop();
-        }
-    }
-
-    pub fn is_bisim(&self, a: Id, b: Id) -> bool {
-        let a = self.find(a);
-        let b = self.find(b);
-        let mut stack = vec![];
-        self.is_bisim_rec(a, b, false, &mut stack)
-    }
-
-    // Maybe I could do this bottom up. Do sort of a hypothetical query that tracks
-    // n*2?
-    */
 
     pub fn rebuild(&mut self) {
         // copy needed for borrowing
@@ -180,7 +122,6 @@ impl EGraph {
                 }
             }
         }
-        // TODO Bisimilar compaction
     }
 
     fn compact(&self) -> Self {
@@ -192,9 +133,6 @@ impl EGraph {
                     f: f.clone(),
                     args: args.iter().map(|id| root_map[&self.find(*id)]).collect(),
                 },
-                Node::FixVar { body } => panic!(
-                    "hmm this is tough actually because we can't count on this already being there."
-                ), // Make a dummy id, come back later and patch it up.
             };
             let id2 = egraph.add_node(new_node);
             let id = self.find(id);
@@ -208,9 +146,9 @@ impl EGraph {
     }
 
     pub fn ematch(&self, pat: &Term, class: Id) -> Vec<Subst> {
-        self.ematch_rec(0, pat, class, Default::default())
+        self.ematch_rec(pat, class, Default::default())
     }
-    pub fn ematch_rec(&self, depth: usize, pat: &Term, class: Id, mut subst: Subst) -> Vec<Subst> {
+    pub fn ematch_rec(&self, pat: &Term, class: Id, mut subst: Subst) -> Vec<Subst> {
         match pat {
             Term::Var(name) => {
                 if let Some(&id) = subst.get(name) {
@@ -234,21 +172,12 @@ impl EGraph {
                                 for (pa, na) in pargs.iter().zip(args.iter()) {
                                     todo = todo
                                         .into_iter()
-                                        .flat_map(|subst| {
-                                            self.ematch_rec(depth + 1, pa, *na, subst)
-                                        })
+                                        .flat_map(|subst| self.ematch_rec(pa, *na, subst))
                                         .collect();
                                 }
 
                                 results.extend(todo);
                             }
-                        }
-                        Node::FixVar { body } => {
-                            assert_ne!(
-                                *body, class,
-                                "If a fix is unioned to itself, something has gone wrong"
-                            ); // Really we should check there are not transitive self loops, but this is cheap and easy
-                            results.extend(self.ematch_rec(depth, pat, *body, subst.clone()));
                         }
                     }
                 }
@@ -277,8 +206,6 @@ impl EGraph {
         }
     }
 
-    // Extraction needs to output a full  definitional equational system. &[Term] where each Term can refer to Var(n) in a fixedpoint manner
-    // Actually this is kind of a nice way to put a name into the egraph that it won't show up in the extraction?
     pub fn extract(&self, class: Id) -> (usize, Term) {
         fn worker(
             egraph: &EGraph,
@@ -306,7 +233,6 @@ impl EGraph {
                         let args = arg_costs.into_iter().map(|(_, term)| term).collect();
                         Some((total_cost, Term::App(f.clone(), args)))
                     }
-                    Node::FixVar { body } => panic!("unpimplemed"),
                 })
                 .min_by_key(|(node_cost, _)| *node_cost);
 
@@ -322,10 +248,22 @@ impl EGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::*; // Import names from parent module
+    use super::*;
     #[test]
-    fn test_coegraph() {
+    fn test_base_egraph() {
         let mut g = EGraph::default();
         g.add_term(&Term::App("a".into(), vec![]), &HashMap::new());
+        let a = g.app("a", vec![]);
+        let b = g.app("b", vec![]);
+        g.union(a, b);
+        assert_eq!(g.find(a), g.find(b));
+    }
+    #[test]
+    fn test_extract() {
+        let mut g = EGraph::default();
+        let a = g.app("a", vec![]);
+        let fa = g.app("f", vec![a]);
+        g.union(fa, a);
+        assert_eq!(g.extract(fa), (1, Term::App("a".into(), vec![])));
     }
 }

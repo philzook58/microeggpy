@@ -1,8 +1,8 @@
 use pyo3::prelude::*;
+pub mod base;
 mod coegraph;
 pub mod thin;
 pub mod uf;
-
 #[pymodule]
 mod microegg {
     use pyo3::prelude::*;
@@ -347,7 +347,7 @@ mod microegg {
 
         pub fn run(&mut self, n: usize) {
             for _i in 0..n {
-                for eclass in 1..self.uf.len() {
+                for eclass in 0..self.uf.len() {
                     self.apply_rules(eclass, 0);
                 }
                 self.rebuild();
