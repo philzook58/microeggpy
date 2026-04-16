@@ -8,7 +8,7 @@ pub enum Node {
     App { f: Name, args: Vec<Id> },
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct EGraph {
     pub memo: HashMap<Node, Id>,
     pub nodes: Vec<Node>, // todo Indexmap?
@@ -23,7 +23,7 @@ pub enum Term {
     // EId
 }
 
-pub type Subst = HashMap<Name, Id>;
+type Subst = HashMap<Name, Id>;
 
 impl EGraph {
     pub fn nodes_in_class(&self, class: Id) -> impl Iterator<Item = &Node> {
@@ -125,7 +125,7 @@ impl EGraph {
         }
     }
 
-    fn compact(&self) -> Self {
+    pub fn compact(&self) -> Self {
         let mut egraph = EGraph::default();
         let mut root_map = HashMap::new();
         for (id, node) in self.nodes.iter().enumerate() {
@@ -138,7 +138,7 @@ impl EGraph {
             let id2 = egraph.add_node(new_node);
             let id = self.find(id);
             if let Some(&existing_id) = root_map.get(&id) {
-                egraph.union(existing_id, id2);
+                egraph.union(id2, existing_id); // order matters?
             } else {
                 root_map.insert(id, id2);
             }
@@ -249,6 +249,8 @@ impl EGraph {
 
 #[cfg(test)]
 mod tests {
+    use crate::{rw, rws, term};
+
     use super::*;
     #[test]
     fn test_base_egraph() {
@@ -266,5 +268,45 @@ mod tests {
         let fa = g.app("f", vec![a]);
         g.union(fa, a);
         assert_eq!(g.extract(fa), (1, Term::App("a".into(), vec![])));
+    }
+
+    #[test]
+    fn test_term_macro_vars() {
+        assert_eq!(
+            term!(f(?x, a, g(?y))),
+            Term::App(
+                "f".into(),
+                vec![
+                    Term::Var("x".into()),
+                    Term::App("a".into(), vec![]),
+                    Term::App("g".into(), vec![Term::Var("y".into())]),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn test_rw_macro() {
+        assert_eq!(
+            rw!(f(?x) => g(?x)),
+            (
+                Term::App("f".into(), vec![Term::Var("x".into())]),
+                Term::App("g".into(), vec![Term::Var("x".into())]),
+            )
+        );
+    }
+
+    #[test]
+    fn test_rws_macro() {
+        assert_eq!(
+            rws![f(?x) => g(?x), a => b],
+            vec![
+                (
+                    Term::App("f".into(), vec![Term::Var("x".into())]),
+                    Term::App("g".into(), vec![Term::Var("x".into())]),
+                ),
+                (Term::App("a".into(), vec![]), Term::App("b".into(), vec![]),),
+            ]
+        );
     }
 }

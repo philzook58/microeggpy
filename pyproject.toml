@@ -3,7 +3,7 @@ requires = ["maturin>=1.11,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "microeggpy"
+name = "microegg"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
@@ -13,7 +13,4 @@ classifiers = [
 dynamic = ["version"]
 
 [dependency-groups]
-dev = [
-    "maturin>=1.11.5",
-    "pytest>=8.3.5",
-]
+dev = ["maturin>=1.11.5", "pytest>=8.3.5"]
