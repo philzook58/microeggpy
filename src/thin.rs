@@ -145,79 +145,6 @@ impl Thin {
     }
 }
 
-mod named {
-    use super::Debug;
-    use super::Thin;
-    use super::zip;
-
-    // Working with named contexts
-    pub fn is_subseq<T: Eq>(big: &[T], small: &[T]) -> Option<Thin> {
-        //! Compute the thinning witness of extracting small from big if it exists.
-        let mut res = Vec::with_capacity(big.len());
-        let mut j = 0;
-        for i in big.iter() {
-            if j < small.len() && i == &small[j] {
-                res.push(true);
-                j += 1;
-            } else {
-                res.push(false);
-            }
-        }
-        if j == small.len() {
-            Some(Thin(res))
-        } else {
-            None
-        }
-    }
-
-    pub fn apply_thin<T: Clone>(thin: &Thin, big: &[T]) -> Vec<T> {
-        //! Apply a thinning to a big context to get the small context.
-        assert_eq!(thin.dom(), big.len());
-        zip(thin.0.iter(), big.iter())
-            .filter(|(b, _)| **b)
-            .map(|(_, x)| x.clone())
-            .collect()
-    }
-
-    // This is the named version of pullback?
-    pub fn common_minctx<T: Eq + Clone + Debug>(
-        big: &[T],
-        small1: &[T],
-        small2: &[T],
-    ) -> (Vec<T>, Thin, Thin) {
-        //! From a maximal context and two needed contexts, find the smallest combo context and thinnning
-        //! small1 = thin @ minctx
-        //! small2 = thin @ minctx
-        //! maxctx is needed to know how to interleave small1 and small2
-        // assert!(is_subseq(big, small1).is_some() && is_subseq(big, small2).is_some()); // I guess the end check is also doing this
-        let mut wide1 = vec![];
-        let mut wide2 = vec![];
-        let mut minctx: Vec<T> = vec![];
-        let mut n1 = 0;
-        let mut n2 = 0;
-        // Reconcile the two minimal contexts. A sorted union
-        for s in big.iter() {
-            let take1 = n1 < small1.len() && small1[n1] == *s;
-            let take2 = n2 < small2.len() && small2[n2] == *s;
-            if take1 {
-                n1 += 1;
-            }
-            if take2 {
-                n2 += 1;
-            }
-            if take1 || take2 {
-                minctx.push(s.clone());
-                wide1.push(take1);
-                wide2.push(take2);
-            }
-        }
-        assert_eq!(n1, small1.len());
-        assert_eq!(n2, small2.len());
-        assert_eq!(minctx.len(), wide1.len());
-        assert_eq!(minctx.len(), wide2.len());
-        (minctx, Thin(wide1), Thin(wide2))
-    }
-}
 type RawId = usize;
 
 /// An Id is the combo of a raw usize identifier and a thinning. This allows lifting an object into a weaker context without having to reintern it.
@@ -253,12 +180,13 @@ impl Id {
 pub enum Term {
     Var(String),
     App(Box<Term>, Box<Term>),
-    //Lam(String, Box<Term>),
     Lit(String),
     EId(Id), // Do I want Vec<String> here? Or does the Id narrow from the full context. But I might not even know
              // PVar(String, Vec<String>) Miller pattern var
              // Drop(String, Box<Term>) explicitly say a variable is dropped. For weakening to an Id? Or for weakening to pattern variable, which then always captures everything
              // Kind of the converse of Lam.
+             //
+             //Lam(String, Box<Term>),
 }
 
 impl Term {
@@ -280,9 +208,7 @@ impl Term {
             Box::new(z),
         )
     }
-    //pub fn lam(v: &str, body: Term) -> Self {
-    //    Term::Lam(v.to_string(), Box::new(body))
-    //}
+
     pub fn lit(s: &str) -> Self {
         Term::Lit(s.to_string())
     }
@@ -293,11 +219,8 @@ type TermInCtx = (Vec<String>, Term);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Node {
     App(Id, Id),
-    // Lam { var_used: bool, rawid: RawId },
-    //Lam(Id), // Lam(var_used:bool, rawid : usize)
     Var,
-    Lit(String), // Symbol? Constant.
-    // Value(Value)
+    Lit(String),
     UNode(Id, Id), // Maybe rawid because everything in eclass has same minimal context. No. rawid are terms which have a very concrete
 }
 
@@ -340,37 +263,14 @@ impl EGraph {
     }
 
     pub fn app(&mut self, f: Id, x: Id) -> Id {
-        assert!(f.ctx() == x.ctx());
+        assert_eq!(f.ctx(), x.ctx());
         let f = self.find(&f);
         let x = self.find(&x);
-        // do find?
-        // scan f for lambda? smart constructor loop might terminate?
-        // add app node version, only subst version, do both
-
-        // fthin :  [false, true, false]  : 3 -> 1
-        // xthin :  [false, false, true] : 3 -> 1
-        // common_thin : [false, true, true] : 3 -> 2
-        // common_thin.conj().comp(common_thin) != id ...? Wha? Is this make any sense at all?
-        // common_thin.conj().(fthin) = proj_fthin : [true, false] : 2 -> 1 // projected to common needed context
-        // proj_xthin : [false, true] // projected common needed context
-        // common_thin @ [true, true] |- App(proj_fthin, proj_xthin)
-        // You want to intern in the smallest possible canonical context
-
         // Construct the app in the smallest common needed context
         let (common, f1thin, x1thin) = f.0.join(&x.0);
         let id = self.add_node(common.cod(), Node::App(Id(f1thin, f.1), Id(x1thin, x.1)));
         // Lift back into context actually requested
         id.weaken(&common)
-
-        /*
-        let thin_to_needed = f.0.bitor(&x.0); // bitwise or
-        assert!(thin_to_needed.0.iter().all(|b| *b));
-        // Wait... But shouldn't it e the case that thin_to_needed is all true?
-        let f1 = Id(f.0.div(&thin_to_needed), f.1);
-        let x1 = Id(x.0.div(&thin_to_needed), x.1);
-        let id = self.add_node(thin_to_needed.cod(), Node::App(f1, x1));
-        id.weaken(&thin_to_needed) // widen the id the common context;
-        */
     }
     /*
     pub fn app_beta(&mut self, f : Id, x : Id) -> Id
@@ -391,27 +291,6 @@ impl EGraph {
     pub fn lit(&mut self, s: String) -> Id {
         self.add_node(0, Node::Lit(s))
     }
-
-    /*
-    fn lam(&mut self, body: Id) -> Id {
-        assert!(
-            body.ctx() != 0,
-            "Body should have at least one variable in its context"
-        );
-        let body = self.find(&body);
-        let thin = body.0.dump0(); // the scope of the lambda is the minctx of the "body.remove(0)", since it hsouldn't matter if body used var or not.
-        // Also here. Everything in body should be true except _possibly_ the first value.
-        // TODO: No. This is wrong. I need to dump, then work in the smallest. Id(Thin::id(thin.cod()), body.1)
-        let id = self.add_node(
-            thin.cod(),
-            Node::Lam {
-                var_used: body.0.0[0],
-                rawid: body.1,
-            },
-        );
-        id.weaken(&thin) // I'm just composing an identity with a thinning. seems wasteful
-    }
-    */
 
     pub fn find(&self, id: &Id) -> Id {
         let Id(mut thin, mut rawid) = id.clone();
@@ -554,68 +433,25 @@ impl EGraph {
         res
     }
 
-    /*
-    In minimal version ignore lambda?
-    */
-
-    /*
-    What I've done to ids is too funky. Now ids
-     */
-    // rebuild?
-    //fn subst(&mut self, s : &Id, v : usize, t : &Id) {}
-    // fn ematch
-    // fn beta() // scan just for beta redexes and subst them
-
-    // Hmm the isomorphism matching. That might be interesting.
-    //fn ematch(&self, )
-
-    // add_term is kind of named_add_node
-
-    fn add_term_helper(&mut self, maxctx: &[String], t: Term) -> UserId {
-        // Hmm. UserId could be a thinning from maxctx.
+    pub fn add_term(&mut self, ctx: &[String], t: &Term) -> Id {
         match t {
-            Term::Var(s) => (vec![s], self.var()), //  (maxctx.map(|name| name == s), self.var()
-            Term::Lit(s) => (vec![], self.lit(s)),
             Term::App(f, x) => {
-                let (fctx, fid) = self.add_term_helper(maxctx, *f);
-                let (xctx, xid) = self.add_term_helper(maxctx, *x);
-                let (minctx, widef, widex) = named::common_minctx(maxctx, &fctx, &xctx);
-                // Hmm. What if add_node returns less than I thought? I should thin minctx
-                (minctx, self.app(fid.weaken(&widef), xid.weaken(&widex)))
+                let f = self.add_term(ctx, f);
+                let x = self.add_term(ctx, x);
+                self.app(f, x)
             }
-            /*
-            Term::Lam(v, body) => {
-                // Search for shadowed x and remove it
-                let mut bodymaxctx = maxctx.to_vec();
-                if let Some(pos) = maxctx.iter().position(|s| *s == v) {
-                    bodymaxctx.remove(pos);
-                }
-                // v is now available in the body in position 0. Should I reverse the direction I do this?
-                bodymaxctx.insert(0, v.clone()); // [x,y,z] -> [v, x,y,z]
-                let (mut bodyminctx, mut bid) = self.add_term_helper(&bodymaxctx, *body);
-                if bodyminctx.len() == 0 || bodyminctx[0] != v {
-                    // If the body doesn't use the variable, we need to pad with a false to kill the variable the lambda introduces.
-                    bid = bid.widen0(); // [true, false] -> [false, true, false]
-                } else {
-                    // If the body does use the bound var, the lam_minctx doesn't have it
-                    bodyminctx.remove(0); // [v, x] -> [x]
-                }
-                (bodyminctx, self.lam(bid))
+            Term::Lit(l) => {
+                let t = Thin(vec![false; ctx.len()]);
+                self.lit(l.clone()).weaken(&t)
             }
-            */
-            Term::EId(id) => {
-                assert!(id.ctx() <= maxctx.len());
-                //  = is_ssubseq(maxctx ,id.1).unwrap()
-                (named::apply_thin(&id.0, maxctx), id)
+            Term::Var(x) => {
+                let idx = ctx.iter().position(|y| y == x).unwrap();
+                let mut t = vec![false; ctx.len()];
+                t[idx] = true;
+                varid().weaken(&Thin(t))
             }
+            Term::EId(eid) => eid.clone(),
         }
-    }
-
-    pub fn add_term(&mut self, ctx: &[String], t: Term) -> UserId {
-        // Make Result.
-        let (minctx, id) = self.add_term_helper(ctx, t);
-        let thin = named::is_subseq(ctx, &minctx).unwrap();
-        (ctx.to_vec(), id.weaken(&thin))
     }
 }
 
@@ -677,15 +513,18 @@ mod tests {
         let y = g.var();
         assert!(x.ctx() == 1);
 
-        let x1 = g.add_term(&["x".to_string()], Term::Var("x".to_string()));
-        assert!(x1.0 == vec!["x".to_string()]);
-        assert!(x1.1 == x);
+        //let x1 = g.add_term(&["x".to_string()], Term::Var("x".to_string()));
+
+        let x1 = g.add_term(&["x".to_string()], &Term::Var("x".to_string()));
+        //assert!(x1.0 == vec!["x".to_string()]);
+        //assert!(x1.1 == x);
 
         let x1 = g.add_term(
             &["x".to_string(), "y".to_string()],
-            Term::Var("x".to_string()),
+            &Term::Var("x".to_string()),
         );
-        assert_eq!(x1.0, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(x1.0.0, vec![true, false]);
+        //assert_eq!(x1.0, vec!["x".to_string(), "y".to_string()]);
         let id1 = g.app(x.clone(), y.clone());
         let id2 = g.app(x.clone(), y.clone());
         assert!(id1 == id2);
@@ -695,8 +534,9 @@ mod tests {
         let b = g.lit("b".to_string());
         assert!(a != b);
 
-        let a1 = g.add_term(&[], Term::Lit("a".to_string()));
-        assert!(a1.1 == a);
+        let a1 = g.add_term(&[], &Term::Lit("a".to_string()));
+        assert_eq!(a, a1);
+        //assert!(a1.1 == a);
 
         let ab = g.app(a.clone(), b.clone());
         assert!(ab.ctx() == 0);
@@ -752,18 +592,18 @@ mod tests {
         );
         */
 
-        let c1 = g.add_term(&[], Term::Lit("c".to_string()));
-        let c2 = g.add_term(&[], Term::Lit("c1".to_string()));
+        let c1 = g.add_term(&[], &Term::Lit("c".to_string()));
+        let c2 = g.add_term(&[], &Term::Lit("c1".to_string()));
         assert!(c1 != c2);
-        assert!(!g.is_eq(&c1.1, &c2.1));
-        assert_eq!(g.all_liftable_node_ids(&c1.1).len(), 1);
-        assert!(g.union(&c1.1, &c2.1));
-        assert_eq!(g.all_liftable_node_ids(&c1.1).len(), 2);
-        assert!(g.is_eq(&c1.1, &c2.1));
+        assert!(!g.is_eq(&c1, &c2));
+        assert_eq!(g.all_liftable_node_ids(&c1).len(), 1);
+        assert!(g.union(&c1, &c2));
+        assert_eq!(g.all_liftable_node_ids(&c1).len(), 2);
+        assert!(g.is_eq(&c1, &c2));
 
         let plusab = g.add_term(
             &["a".to_string(), "b".to_string()],
-            Term::App(
+            &Term::App(
                 Box::new(Term::App(
                     Box::new(Term::Lit("+".to_string())),
                     Box::new(Term::Var("a".to_string())),
@@ -773,7 +613,7 @@ mod tests {
         );
         let plusba = g.add_term(
             &["a".to_string(), "b".to_string()],
-            Term::App(
+            &Term::App(
                 Box::new(Term::App(
                     Box::new(Term::Lit("+".to_string())),
                     Box::new(Term::Var("b".to_string())),
@@ -781,24 +621,24 @@ mod tests {
                 Box::new(Term::Var("a".to_string())),
             ),
         );
-        assert!(!g.is_eq(&plusab.1, &plusba.1));
-        assert!(g.union(&plusab.1, &plusba.1));
-        let newid = g.find(&plusab.1);
-        assert!(g.is_eq(&plusab.1, &plusba.1));
+        assert!(!g.is_eq(&plusab, &plusba));
+        assert!(g.union(&plusab, &plusba));
+        let newid = g.find(&plusab);
+        assert!(g.is_eq(&plusab, &plusba));
 
         let n_nodes = g.nodes.len();
         // A construction macro would be killer.
         let plusxy = g.add_term(
             &["x".to_string(), "y".to_string()],
-            Term::app2(Term::lit("+"), Term::var("x"), Term::var("y")),
+            &Term::app2(Term::lit("+"), Term::var("x"), Term::var("y")),
         );
         assert_eq!(g.nodes.len(), n_nodes, "Should hit the memo");
-        assert_eq!(plusxy.0, vec!["x".to_string(), "y".to_string()]);
-        assert_eq!(plusxy.1, newid, "finds to newid");
-        assert!(g.is_eq(&plusxy.1, &plusab.1), "Should be equal to plusab");
+        assert_eq!(plusxy.0.0, vec![true, true]);
+        assert_eq!(plusxy, newid, "finds to newid");
+        assert!(g.is_eq(&plusxy, &plusab), "Should be equal to plusab");
 
         assert_eq!(
-            g.all_liftable_node_ids(&plusab.1).len(),
+            g.all_liftable_node_ids(&plusab).len(),
             2,
             "Should have two nodes in class",
         );
@@ -806,24 +646,24 @@ mod tests {
         let mut g = EGraph::new();
         let xzero = g.add_term(
             &["x".to_string()],
-            Term::app2(Term::lit("+"), Term::var("x"), Term::lit("zero")),
+            &Term::app2(Term::lit("+"), Term::var("x"), Term::lit("zero")),
         );
-        assert_eq!(xzero.0.len(), 1);
-        let zero = g.add_term(&["x".to_string()], Term::lit("zero"));
-        assert_eq!(zero.0.len(), 1);
+        assert_eq!(xzero.0.0, vec![true]);
+        let zero = g.add_term(&["x".to_string()], &Term::lit("zero"));
+        assert_eq!(zero.0.0, vec![false]);
+        assert_eq!(zero.ctx(), 1);
         // Hmm. unon a different contexts _could_ mean kill. But
         //g.union(&zero.1, &xzero.1);
-        g.named_union(&["x".to_string()], zero.clone(), xzero.clone());
-        let zero1 = g.named_find(&zero);
-        assert_eq!(zero1.0.len(), 0);
-
-        let zero2 = g.named_find(&xzero);
-        assert_eq!(zero2.0.len(), 0);
+        g.union(&zero, &xzero);
+        let zero1 = g.find(&zero);
+        assert_eq!(zero1.0.cod(), 0);
+        let zero2 = g.find(&xzero);
+        assert_eq!(zero2.0.cod(), 0);
 
         assert_eq!(zero1, zero2);
 
         //assert_eq!(g.nodes_in_class(&zero2.1).len(), 2);
-        assert_eq!(g.all_liftable_node_ids(&Id(Thin::id(0), zero.1.1)).len(), 1);
+        assert_eq!(g.all_liftable_node_ids(&Id(Thin::id(0), zero.1)).len(), 1);
 
         // Or is this just wrong. We should never be calling app on something that has
         // Widening should commute with app  app(f,x).wide() == app(f.wide(), x.wide())
@@ -843,7 +683,192 @@ mod tests {
     }
 }
 
+mod named {
+    use super::Debug;
+    use super::Thin;
+    use super::zip;
+
+    // Working with named contexts
+    pub fn is_subseq<T: Eq>(big: &[T], small: &[T]) -> Option<Thin> {
+        //! Compute the thinning witness of extracting small from big if it exists.
+        let mut res = Vec::with_capacity(big.len());
+        let mut j = 0;
+        for i in big.iter() {
+            if j < small.len() && i == &small[j] {
+                res.push(true);
+                j += 1;
+            } else {
+                res.push(false);
+            }
+        }
+        if j == small.len() {
+            Some(Thin(res))
+        } else {
+            None
+        }
+    }
+
+    pub fn apply_thin<T: Clone>(thin: &Thin, big: &[T]) -> Vec<T> {
+        //! Apply a thinning to a big context to get the small context.
+        assert_eq!(thin.dom(), big.len());
+        zip(thin.0.iter(), big.iter())
+            .filter(|(b, _)| **b)
+            .map(|(_, x)| x.clone())
+            .collect()
+    }
+
+    // This is the named version of pullback?
+    pub fn common_minctx<T: Eq + Clone + Debug>(
+        big: &[T],
+        small1: &[T],
+        small2: &[T],
+    ) -> (Vec<T>, Thin, Thin) {
+        //! From a maximal context and two needed contexts, find the smallest combo context and thinnning
+        //! small1 = thin @ minctx
+        //! small2 = thin @ minctx
+        //! maxctx is needed to know how to interleave small1 and small2
+        // assert!(is_subseq(big, small1).is_some() && is_subseq(big, small2).is_some()); // I guess the end check is also doing this
+        let mut wide1 = vec![];
+        let mut wide2 = vec![];
+        let mut minctx: Vec<T> = vec![];
+        let mut n1 = 0;
+        let mut n2 = 0;
+        // Reconcile the two minimal contexts. A sorted union
+        for s in big.iter() {
+            let take1 = n1 < small1.len() && small1[n1] == *s;
+            let take2 = n2 < small2.len() && small2[n2] == *s;
+            if take1 {
+                n1 += 1;
+            }
+            if take2 {
+                n2 += 1;
+            }
+            if take1 || take2 {
+                minctx.push(s.clone());
+                wide1.push(take1);
+                wide2.push(take2);
+            }
+        }
+        assert_eq!(n1, small1.len());
+        assert_eq!(n2, small2.len());
+        assert_eq!(minctx.len(), wide1.len());
+        assert_eq!(minctx.len(), wide2.len());
+        (minctx, Thin(wide1), Thin(wide2))
+    }
+}
 /*
+
+    //pub fn lam(v: &str, body: Term) -> Self {
+    //    Term::Lam(v.to_string(), Box::new(body))
+    //}
+    /*
+    fn lam(&mut self, body: Id) -> Id {
+        assert!(
+            body.ctx() != 0,
+            "Body should have at least one variable in its context"
+        );
+        let body = self.find(&body);
+        let thin = body.0.dump0(); // the scope of the lambda is the minctx of the "body.remove(0)", since it hsouldn't matter if body used var or not.
+        // Also here. Everything in body should be true except _possibly_ the first value.
+        // TODO: No. This is wrong. I need to dump, then work in the smallest. Id(Thin::id(thin.cod()), body.1)
+        let id = self.add_node(
+            thin.cod(),
+            Node::Lam {
+                var_used: body.0.0[0],
+                rawid: body.1,
+            },
+        );
+        id.weaken(&thin) // I'm just composing an identity with a thinning. seems wasteful
+    }
+    */
+    /*
+    In minimal version ignore lambda?
+    */
+
+    /*
+    What I've done to ids is too funky. Now ids
+     */
+    // rebuild?
+    //fn subst(&mut self, s : &Id, v : usize, t : &Id) {}
+    // fn ematch
+    // fn beta() // scan just for beta redexes and subst them
+
+    // Hmm the isomorphism matching. That might be interesting.
+    //fn ematch(&self, )
+    // Lam { var_used: bool, rawid: RawId },
+    //Lam(Id), // Lam(var_used:bool, rawid : usize)
+    // Symbol? Constant.
+    // Value(Value)
+
+    // add_term is kind of named_add_node
+
+    fn add_term_helper(&mut self, maxctx: &[String], t: Term) -> UserId {
+        // Hmm. UserId could be a thinning from maxctx.
+        match t {
+            Term::Var(s) => (vec![s], self.var()), //  (maxctx.map(|name| name == s), self.var()
+            Term::Lit(s) => (vec![], self.lit(s)),
+            Term::App(f, x) => {
+                let (fctx, fid) = self.add_term_helper(maxctx, *f);
+                let (xctx, xid) = self.add_term_helper(maxctx, *x);
+                let (minctx, widef, widex) = named::common_minctx(maxctx, &fctx, &xctx);
+                // Hmm. What if add_node returns less than I thought? I should thin minctx
+                (minctx, self.app(fid.weaken(&widef), xid.weaken(&widex)))
+            }
+            /*
+            Term::Lam(v, body) => {
+                // Search for shadowed x and remove it
+                let mut bodymaxctx = maxctx.to_vec();
+                if let Some(pos) = maxctx.iter().position(|s| *s == v) {
+                    bodymaxctx.remove(pos);
+                }
+                // v is now available in the body in position 0. Should I reverse the direction I do this?
+                bodymaxctx.insert(0, v.clone()); // [x,y,z] -> [v, x,y,z]
+                let (mut bodyminctx, mut bid) = self.add_term_helper(&bodymaxctx, *body);
+                if bodyminctx.len() == 0 || bodyminctx[0] != v {
+                    // If the body doesn't use the variable, we need to pad with a false to kill the variable the lambda introduces.
+                    bid = bid.widen0(); // [true, false] -> [false, true, false]
+                } else {
+                    // If the body does use the bound var, the lam_minctx doesn't have it
+                    bodyminctx.remove(0); // [v, x] -> [x]
+                }
+                (bodyminctx, self.lam(bid))
+            }
+            */
+            Term::EId(id) => {
+                assert!(id.ctx() <= maxctx.len());
+                //  = is_ssubseq(maxctx ,id.1).unwrap()
+                (named::apply_thin(&id.0, maxctx), id)
+            }
+        }
+    }
+
+    pub fn add_term(&mut self, ctx: &[String], t: Term) -> UserId {
+        // Make Result.
+        let (minctx, id) = self.add_term_helper(ctx, t);
+        let thin = named::is_subseq(ctx, &minctx).unwrap();
+        (ctx.to_vec(), id.weaken(&thin))
+    }
+        /*
+                // do find?
+        // scan f for lambda? smart constructor loop might terminate?
+        // add app node version, only subst version, do both
+
+        // fthin :  [false, true, false]  : 3 -> 1
+        // xthin :  [false, false, true] : 3 -> 1
+        // common_thin : [false, true, true] : 3 -> 2
+        // common_thin.conj().comp(common_thin) != id ...? Wha? Is this make any sense at all?
+        // common_thin.conj().(fthin) = proj_fthin : [true, false] : 2 -> 1 // projected to common needed context
+        // proj_xthin : [false, true] // projected common needed context
+        // common_thin @ [true, true] |- App(proj_fthin, proj_xthin)
+        // You want to intern in the smallest possible canonical context
+        let thin_to_needed = f.0.bitor(&x.0); // bitwise or
+        assert!(thin_to_needed.0.iter().all(|b| *b));
+        // Wait... But shouldn't it e the case that thin_to_needed is all true?
+        let f1 = Id(f.0.div(&thin_to_needed), f.1);
+        let x1 = Id(x.0.div(&thin_to_needed), x.1);
+        let id = self.add_node(thin_to_needed.cod(), Node::App(f1, x1));
+        id.weaken(&thin_to_needed) // widen the id the common context;
+        */
 
 /*
             for (thin, rawid) in ids {
