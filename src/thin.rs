@@ -17,6 +17,16 @@ impl Thin {
         Thin(vec![true; n])
     }
 
+    pub fn select(ctx: usize, n: usize) -> Self {
+        let mut t = vec![false; ctx];
+        t[n] = true;
+        Thin(t)
+    }
+
+    pub fn unused(ctx: usize) -> Self {
+        Thin(vec![false; ctx])
+    }
+
     pub fn is_id(&self) -> bool {
         self.0.iter().all(|b| *b)
     }
@@ -28,13 +38,6 @@ impl Thin {
 
     pub fn cod(&self) -> usize {
         self.0.iter().filter(|i| **i).count()
-    }
-
-    fn dump0(&self) -> Self {
-        //! Dump the first variable in the context. Useful for lambda abstraction where lambdas create a variable in scope
-        let mut thin = self.0.clone();
-        thin.remove(0);
-        Thin(thin)
     }
 
     pub fn comp(&self, small: &Thin) -> Thin {
@@ -167,12 +170,6 @@ impl Id {
         //! The minimal context needed to make sense of the rawid.
         self.0.cod()
     }
-    pub fn widen0(&self) -> Self {
-        //! Widen to a context with one more variable that is not used. Useful for lambda abstraction when the body doesn't use the bound var.
-        let mut thin = vec![false];
-        thin.extend(self.0.0.iter());
-        Id(Thin(thin), self.1)
-    }
 }
 
 /// An ordinary syntax tree for user readability. Using the raw api is very painful and error prone.
@@ -214,8 +211,6 @@ impl Term {
     }
 }
 
-type TermInCtx = (Vec<String>, Term);
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Node {
     App(Id, Id),
@@ -234,8 +229,6 @@ pub struct EGraph {
 pub fn varid() -> Id {
     Id(Thin::id(1), 0)
 }
-
-type UserId = (Vec<String>, Id);
 
 impl EGraph {
     pub fn new() -> Self {
@@ -288,8 +281,8 @@ impl EGraph {
         varid()
     }
 
-    pub fn lit(&mut self, s: String) -> Id {
-        self.add_node(0, Node::Lit(s))
+    pub fn lit(&mut self, s: impl AsRef<str>) -> Id {
+        self.add_node(0, Node::Lit(s.as_ref().to_owned()))
     }
 
     pub fn find(&self, id: &Id) -> Id {
@@ -306,10 +299,6 @@ impl EGraph {
         }
     }
 
-    pub fn named_find(&self, nid: &UserId) -> UserId {
-        let id = self.find(&nid.1);
-        (named::apply_thin(&id.0, &nid.0), id)
-    }
     pub fn is_eq(&mut self, a: &Id, b: &Id) -> bool {
         self.find(a) == self.find(b)
     }
@@ -340,20 +329,6 @@ impl EGraph {
             self.uf[a.1] = Id(proj_a, rawz);
             self.uf[b.1] = Id(proj_b, rawz);
             true
-        }
-    }
-
-    pub fn named_union(&mut self, ctx: &[String], a: UserId, b: UserId) -> bool {
-        let (minctx, thina, thinb) = named::common_minctx(ctx, &a.0, &b.0);
-        self.union(&a.1.weaken(&thina), &b.1.weaken(&thinb))
-    }
-
-    pub fn named_union0(&mut self, a: UserId, b: UserId) -> Option<bool> {
-        // Result.
-        if a.0 == b.0 {
-            Some(self.union(&a.1, &b.1))
-        } else {
-            None
         }
     }
 
@@ -440,15 +415,10 @@ impl EGraph {
                 let x = self.add_term(ctx, x);
                 self.app(f, x)
             }
-            Term::Lit(l) => {
-                let t = Thin(vec![false; ctx.len()]);
-                self.lit(l.clone()).weaken(&t)
-            }
+            Term::Lit(l) => self.lit(l.clone()).weaken(&Thin::unused(ctx.len())),
             Term::Var(x) => {
                 let idx = ctx.iter().position(|y| y == x).unwrap();
-                let mut t = vec![false; ctx.len()];
-                t[idx] = true;
-                varid().weaken(&Thin(t))
+                varid().weaken(&Thin::select(ctx.len(), idx))
             }
             Term::EId(eid) => eid.clone(),
         }
@@ -757,6 +727,38 @@ mod named {
     }
 }
 /*
+type UserId = (Vec<String>, Id);
+
+    pub fn named_union0(&mut self, a: UserId, b: UserId) -> Option<bool> {
+        // Result.
+        if a.0 == b.0 {
+            Some(self.union(&a.1, &b.1))
+        } else {
+            None
+        }
+    }
+    pub fn named_union(&mut self, ctx: &[String], a: UserId, b: UserId) -> bool {
+        let (minctx, thina, thinb) = named::common_minctx(ctx, &a.0, &b.0);
+        self.union(&a.1.weaken(&thina), &b.1.weaken(&thinb))
+    }
+    pub fn named_find(&self, nid: &UserId) -> UserId {
+        let id = self.find(&nid.1);
+        (named::apply_thin(&id.0, &nid.0), id)
+    }
+type TermInCtx = (Vec<String>, Term);
+
+    pub fn widen0(&self) -> Self {
+        //! Widen to a context with one more variable that is not used. Useful for lambda abstraction when the body doesn't use the bound var.
+        let mut thin = vec![false];
+        thin.extend(self.0.0.iter());
+        Id(Thin(thin), self.1)
+    }
+    fn dump0(&self) -> Self {
+        //! Dump the first variable in the context. Useful for lambda abstraction where lambdas create a variable in scope
+        let mut thin = self.0.clone();
+        thin.remove(0);
+        Thin(thin)
+    }
 
     //pub fn lam(v: &str, body: Term) -> Self {
     //    Term::Lam(v.to_string(), Box::new(body))

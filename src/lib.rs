@@ -2,6 +2,8 @@ use pyo3::prelude::*;
 pub mod base;
 mod coegraph;
 pub mod macros;
+pub mod prolog;
+pub mod pthin;
 pub mod thin;
 pub mod uf;
 #[pymodule]
