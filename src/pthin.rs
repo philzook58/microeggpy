@@ -1,5 +1,17 @@
 use std::collections::HashMap;
 use std::iter::zip;
+
+/*
+lift :
+dump :
+
+PThin represents a normal form of lifting and dumping combinators on functional expressions
+  lift(t,dump(d, f))
+dump partially applies f to some junk constants.
+I suppose dump could contain values? eids?
+lift allows f to take more arguments by throwing them away.
+*/
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PThin {
     thin: Vec<bool>,
@@ -303,6 +315,9 @@ impl EGraph {
         }
     }
 }
+
+// Is 0 |- var == junk ?   ([],[false]) @ var ought to be junk. var = id.
+// literals should come with a context too? Then remove var. What about multiaorted vars
 
 #[cfg(test)]
 mod tests {

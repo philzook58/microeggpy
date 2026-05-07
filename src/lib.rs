@@ -4,8 +4,9 @@ mod coegraph;
 pub mod macros;
 pub mod prolog;
 pub mod pthin;
+pub mod sexp;
 pub mod thin;
-pub mod uf;
+// pub mod uf;
 #[pymodule]
 mod microegg {
     use pyo3::prelude::*;
@@ -180,6 +181,16 @@ mod microegg {
                 args: args.into(),
             };
             self.add_node(node)
+        }
+
+        pub fn add_term0(&mut self, t: &Term) -> Id {
+            match t {
+                Term::App(f, args) => {
+                    let args = args.iter().map(|a| self.add_term0(a)).collect();
+                    self.add(f, args)
+                }
+                Term::Var(_) => panic!("cannot add term with var"),
+            }
         }
 
         pub fn union(&mut self, a: Id, b: Id) {
