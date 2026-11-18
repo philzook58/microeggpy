@@ -1,1151 +1,883 @@
-//! A Thinning EGraph to support alpha invariance
+//! A lifting e-graph: IDs place a shared class into an ordered variable context.
+//! Core algorithms adapted from philzook58/lambda-microegg, without substitution.
+//!
+//! Liftings are annotations on the edges of the union-find, akin to group
+//! elements like offsets. Each ID represents a function taking ordered arguments;
+//! lifting adds redundant arguments:
+//!
+//! ```text
+//! fun x y => x + y  -----lift_101----->  fun x y z => x + z
+//! ```
+//!
+//! These functions are NOT equal, but are clearly highly related. The lifting
+//! e-graph deduplicates interning memory for different lifts of the same base
+//! function. Liftings have identity and composition. They form a category
+//! (uh oh! I said the C word!).
+//!
+//! Philip's original explanations:
+//! - <https://www.philipzucker.com/thin1/>
+//! - <https://www.philipzucker.com/lambda_miller_egg/>
+//! - <https://github.com/philzook58/lambda-microegg>
+mod extract;
 
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::iter::zip;
+use indexmap::IndexMap;
+use pyo3::{exceptions::PyValueError, prelude::*};
+use std::collections::{HashMap, HashSet};
+
+/// An order-preserving injection. Bits run outermost to innermost; true selects a variable.
+/// Equivalently, a bitvector selects a smaller context from a larger one:
+/// `[x, y, z]` with `[true, false, true]` selects `[x, z]`.
+/// As a lifting, the same bits embed a function of `[x, z]` into `[x, y, z]`,
+/// leaving `y` unused. Here `dom()` counts selected variables and `cod()` is
+/// the ambient context length: the injection direction used in lambda-microegg.
+#[pyclass(frozen, eq, hash, get_all, module = "microegg.thin")]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Thin(Vec<bool>); // TODO: swtich to bitvec. smallbitvec, or smallvec, u32, box_leak;
-// Is there a lighter weight thing if it doesn't need to be resizable? Neh.
+pub struct Thin {
+    pub bits: Vec<bool>,
+}
+
+#[pymethods]
+impl Thin {
+    #[new]
+    pub fn new(bits: Vec<bool>) -> Self {
+        Self { bits }
+    }
+    #[staticmethod]
+    pub fn identity(ctx: usize) -> Self {
+        Self::new(vec![true; ctx])
+    }
+    #[staticmethod]
+    pub fn unused(ctx: usize) -> Self {
+        Self::new(vec![false; ctx])
+    }
+    #[staticmethod]
+    pub fn select(ctx: usize, level: usize) -> PyResult<Self> {
+        if level >= ctx {
+            return Err(PyValueError::new_err(
+                "variable level is outside its context",
+            ));
+        }
+        let mut bits = vec![false; ctx];
+        bits[level] = true;
+        Ok(Self::new(bits))
+    }
+    pub fn dom(&self) -> usize {
+        self.bits.iter().filter(|&&b| b).count()
+    }
+    pub fn cod(&self) -> usize {
+        self.bits.len()
+    }
+    /// `outer.compose(inner)` places the inner context through the outer injection.
+    /// If `outer : A -> Γ` and `inner : B -> A`, the result is `B -> Γ`.
+    /// The inner mask selects among the variables already selected by outer.
+    pub fn compose(&self, inner: &Self) -> PyResult<Self> {
+        if self.dom() != inner.cod() {
+            return Err(PyValueError::new_err(
+                "thinning composition context mismatch",
+            ));
+        }
+        Ok(self.comp(inner))
+    }
+    fn __repr__(&self) -> String {
+        format!("Thin({:?})", self.bits)
+    }
+}
 
 impl Thin {
-    //! Thinnings are mappings between contexts represented as bitvectors. true means keep, false means drop.
-    //! They can also be thought of as liftings of functions by adding unused arguments
-    //! [x,y,z].thin([true,false,true]) => [x,z]
-    //! [x,z].widen([true,false,true]) => [x,_,z]
-    //! https://www.philipzucker.com/thin1/
-    pub fn id(n: usize) -> Self {
-        Thin(vec![true; n])
+    fn comp(&self, inner: &Self) -> Self {
+        debug_assert_eq!(self.dom(), inner.cod());
+        let mut bits = inner.bits.iter();
+        Self::new(
+            self.bits
+                .iter()
+                .map(|&keep| keep && *bits.next().unwrap())
+                .collect(),
+        )
     }
-
-    pub fn select(ctx: usize, n: usize) -> Self {
-        let mut t = vec![false; ctx];
-        t[n] = true;
-        Thin(t)
+    // Extend the ambient context by its newest variable. Under a binder,
+    // append(true) carries that bound variable along with the outer context.
+    fn append(&self, keep: bool) -> Self {
+        let mut bits = self.bits.clone();
+        bits.push(keep);
+        Self::new(bits)
     }
-
-    pub fn unused(ctx: usize) -> Self {
-        Thin(vec![false; ctx])
-    }
-
-    pub fn is_id(&self) -> bool {
-        self.0.iter().all(|b| *b)
-    }
-
-    /// Thinning go from big to small
-    pub fn dom(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn cod(&self) -> usize {
-        self.0.iter().filter(|i| **i).count()
-    }
-
-    pub fn comp(&self, small: &Thin) -> Thin {
-        //! compose self with small. self : A -> B, small : B -> C, output : A -> C
-        assert_eq!(self.cod(), small.dom());
-        let mut res = Vec::with_capacity(self.0.len());
-        let mut j = 0;
-        for b in self.0.iter() {
-            if *b {
-                res.push(small.0[j]);
-                j += 1;
-            } else {
-                res.push(false);
-            }
+    /// Factor `target` through this thinning. If `self : A -> Γ` and
+    /// `target : B -> Γ`, return the unique ordered thinning `B -> A`.
+    /// `self.comp(result) == target`; fail if target uses a variable absent in self.
+    fn factor(&self, target: &Self) -> Option<Self> {
+        if self.cod() != target.cod() {
+            return None;
         }
-        Thin(res)
-    }
-
-    //pub fn comp_mut(&mut self, other : &Thin){
-    //}
-
-    pub fn meet(&self, other: &Thin) -> (Thin, Thin, Thin) {
-        //! widest_common_subthinning
-        //! meet
-        //! Compute the bitwise and widest common thinning and how to get there.
-        //! self.comp(out.1) = other.comp(out.2)
-        //! Pullback?
-        debug_assert_eq!(self.dom(), other.dom());
-        // Should I just do the dumb loop?
-        let mut common = Vec::with_capacity(self.dom());
-        let mut proj_self = vec![];
-        let mut proj_other = vec![];
-        for (&a, &b) in zip(self.0.iter(), other.0.iter()) {
-            common.push(a && b);
+        let mut bits = vec![];
+        for (&a, &b) in self.bits.iter().zip(&target.bits) {
+            if b && !a {
+                return None;
+            }
             if a {
-                proj_self.push(b);
-            }
-            if b {
-                proj_other.push(a);
+                bits.push(b);
             }
         }
-        (Thin(common), Thin(proj_self), Thin(proj_other))
+        Some(Self::new(bits))
     }
-
-    pub fn join(&self, other: &Thin) -> (Thin, Thin, Thin) {
-        //! thinnest_common_superthinning
-        //! join
-        //! union
-        //! bitwise or
-        // pushout?
-        // common prefix
-        debug_assert_eq!(self.dom(), other.dom());
-        let mut prefix = Vec::with_capacity(self.dom());
-        let mut proj_self = vec![];
-        let mut proj_other = vec![];
-        for (&a, &b) in zip(self.0.iter(), other.0.iter()) {
-            prefix.push(a || b);
-            if a || b {
-                proj_self.push(a);
-                proj_other.push(b);
-            }
-        }
-        (Thin(prefix), Thin(proj_self), Thin(proj_other))
-    }
-
-    fn is_ge(&self, other: &Thin) -> bool {
-        //! Is self a subthinning of other? I.e. is there a thinning from self to other?
-        //! Proof relevant version would return the thinning that does it. Does there exists t, such that self . t = other
-        debug_assert_eq!(self.dom(), other.dom());
-        zip(self.0.iter(), other.0.iter()).all(|(a, b)| !*a || *b)
-    }
-
-    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
+    /// Form the union of two subcontexts of one shared ambient context.
+    /// This is their coproduct in the subcontext lattice. Application needs
+    /// precisely this union of the function's and argument's dependencies.
+    /// Factor each input through the result to place its child in that context.
+    fn join(&self, other: &Self) -> Self {
         debug_assert_eq!(self.cod(), other.cod());
-        if self.dom() <= other.dom() {
-            if self == other {
-                return vec![self.clone()];
-            } else {
-                return vec![];
-            }
+        Self::new(
+            self.bits
+                .iter()
+                .zip(&other.bits)
+                .map(|(a, b)| a | b)
+                .collect(),
+        )
+    }
+    /// Pull back two thinnings into a shared ambient context: intersect their
+    /// dependency subcontexts, and return the maps from that intersection into
+    /// each input context. For `(common, left, right)`:
+    /// `self.comp(left) == common` and `other.comp(right) == common`.
+    /// Equality can retain only dependencies available on both sides.
+    fn meet(&self, other: &Self) -> (Self, Self, Self) {
+        debug_assert_eq!(self.cod(), other.cod());
+        let common = Self::new(
+            self.bits
+                .iter()
+                .zip(&other.bits)
+                .map(|(a, b)| a & b)
+                .collect(),
+        );
+        let left = self.factor(&common).unwrap();
+        let right = other.factor(&common).unwrap();
+        (common, left, right)
+    }
+    /// Largest subcontext of their shared domain on which the two thinnings
+    /// agree, context variable by context variable. Compare the selected
+    /// positions in order, rather than intersecting their ambient bitmasks.
+    fn equalizer(&self, other: &Self) -> Self {
+        fn positions(t: &Thin) -> impl Iterator<Item = usize> + '_ {
+            t.bits
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &keep)| keep.then_some(i))
         }
-        // tuple of how far along in other and current prefix
-        let mut partials = vec![(0, Vec::with_capacity(self.dom()))];
-        for &target in &self.0 {
-            let mut next = Vec::new();
-            for (j, bits) in partials {
-                if !target {
-                    let mut skip = bits.clone();
-                    skip.push(false);
-                    next.push((j, skip));
-                }
-
-                if j < other.dom() && other.0[j] == target {
-                    let mut take = bits;
-                    take.push(true);
-                    next.push((j + 1, take));
-                }
-            }
-            partials = next;
-        }
-
-        let res = partials
-            .into_iter()
-            .filter_map(|(j, bits)| (j == other.dom()).then_some(Thin(bits)))
-            .collect::<Vec<_>>();
-        debug_assert!(res.iter().all(|t| t.comp(other) == *self));
-        res
+        Self::new(
+            positions(self)
+                .zip(positions(other))
+                .map(|(a, b)| a == b)
+                .collect(),
+        )
     }
 }
 
-type RawId = usize;
-
-/// An Id is the combo of a raw usize identifier and a thinning. This allows lifting an object into a weaker context without having to reintern it.
+/// A graph-local raw class and its placement in an ambient context.
+/// This fat ID allows lifting an object into a weaker context without having
+/// to reintern it. Its thinning embeds the raw class's own context into `ctx`.
+#[pyclass(frozen, eq, hash, get_all, module = "microegg.thin")]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Id(Thin, RawId);
-// Possibly Var could be factored to be a case in this enum. Eh. The convention that id = 0 is var seems fine.
-// enum Id { EId(Thin, usize), Var} but Var might still need to be thinng. Id = (Thin, Option<usize) ?
-impl Id {
-    pub fn weaken(&self, thin: &Thin) -> Id {
-        //! The action of widening / weakening on an Id. Brings the id into a larger context with some unused stuff in the context.
-        assert_eq!(thin.cod(), self.0.dom());
-        Id(thin.comp(&self.0), self.1)
-    }
+pub struct Id {
+    pub raw: usize,
+    pub thinning: Thin,
+}
 
+#[pymethods]
+impl Id {
+    #[getter]
     pub fn ctx(&self) -> usize {
-        //! The big context the Id has currently been lifted to
-        self.0.dom()
+        self.thinning.cod()
     }
-    pub fn minctx(&self) -> usize {
-        //! The minimal context needed to make sense of the rawid.
-        self.0.cod()
+    /// Widen an ID into a larger context with unused variables. Only its
+    /// placement changes; the interned raw class stays the same.
+    pub fn weaken(&self, by: &Thin) -> PyResult<Self> {
+        if by.dom() != self.ctx() {
+            return Err(PyValueError::new_err("weakening context mismatch"));
+        }
+        Ok(self.lift(by))
+    }
+    /// Add unused trailing variables, or remove trailing variables not used by this ID.
+    pub fn in_context(&self, ctx: usize) -> PyResult<Self> {
+        if self.thinning.bits.iter().skip(ctx).any(|&b| b) {
+            return Err(PyValueError::new_err(
+                "cannot discard a used context variable; find the ID after rebuilding first",
+            ));
+        }
+        let mut bits = self.thinning.bits.clone();
+        bits.resize(ctx, false);
+        Ok(Self {
+            raw: self.raw,
+            thinning: Thin::new(bits),
+        })
+    }
+    fn __repr__(&self) -> String {
+        format!("Id({}, {:?})", self.raw, self.thinning.bits)
+    }
+}
+impl Id {
+    fn new(raw: usize, thinning: Thin) -> Self {
+        Self { raw, thinning }
+    }
+    fn lift(&self, by: &Thin) -> Self {
+        Self::new(self.raw, by.comp(&self.thinning))
     }
 }
 
-/// An ordinary syntax tree for user readability. Using the raw api is very painful and error prone.
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-pub enum Term {
-    Var(String),
+// One syntax type serves concrete terms and patterns. Boxing stays inside Rust;
+// only the small constructors below adapt recursive children for PyO3.
+// A de Bruijn index counts outward from the nearest binder; a level names a
+// variable coming down from the ambient context. These are for conventional
+// user syntax, beside the main point of thinning/lifting inside the e-graph.
+// Working with raw thinnings is too mind boggling.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum Kind {
+    Atom(String),
+    FVar(usize),
+    BVar(usize),
     App(Box<Term>, Box<Term>),
-    Lit(String),
-    EId(Id), // Do I want Vec<String> here? Or does the Id narrow from the full context. But I might not even know
-             // PVar(String, Vec<String>) Miller pattern var
-             // Drop(String, Box<Term>) explicitly say a variable is dropped. For weakening to an Id? Or for weakening to pattern variable, which then always captures everything
-             // Kind of the converse of Lam.
-             //
-             //Lam(String, Box<Term>),
+    Binder(String, Box<Term>),
+    Meta(String, Vec<usize>),
+}
+
+#[pyclass(frozen, eq, hash, module = "microegg.thin")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Term {
+    kind: Kind,
+}
+
+#[pymethods]
+impl Term {
+    #[staticmethod]
+    pub fn atom(name: String) -> Self {
+        Self {
+            kind: Kind::Atom(name),
+        }
+    }
+    #[staticmethod]
+    pub fn fvar(level: usize) -> Self {
+        Self {
+            kind: Kind::FVar(level),
+        }
+    }
+    #[staticmethod]
+    pub fn bvar(index: usize) -> Self {
+        Self {
+            kind: Kind::BVar(index),
+        }
+    }
+    #[staticmethod]
+    pub fn app(function: Self, argument: Self) -> Self {
+        Self {
+            kind: Kind::App(Box::new(function), Box::new(argument)),
+        }
+    }
+    #[staticmethod]
+    pub fn binder(op: String, body: Self) -> Self {
+        Self {
+            kind: Kind::Binder(op, Box::new(body)),
+        }
+    }
+    #[staticmethod]
+    #[pyo3(signature = (name, parameters = vec![]))]
+    pub fn meta(name: String, parameters: Vec<usize>) -> Self {
+        Self {
+            kind: Kind::Meta(name, parameters),
+        }
+    }
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.kind)
+    }
 }
 
 impl Term {
-    pub fn var(v: &str) -> Self {
-        Term::Var(v.to_string())
+    fn validate(
+        &self,
+        depth: usize,
+        vars: &mut HashMap<String, usize>,
+        concrete: bool,
+    ) -> PyResult<()> {
+        match &self.kind {
+            Kind::Meta(name, args) => {
+                if concrete {
+                    return Err(PyValueError::new_err(
+                        "concrete terms cannot contain metavariables",
+                    ));
+                }
+                if args.iter().any(|&i| i >= depth) {
+                    return Err(PyValueError::new_err(
+                        "Miller parameter is outside the pattern binders",
+                    ));
+                }
+                if !args.windows(2).all(|w| w[0] > w[1]) {
+                    return Err(PyValueError::new_err(
+                        "Miller parameters must be distinct and ordered outermost to innermost (decreasing indices)",
+                    ));
+                }
+                if vars
+                    .insert(name.clone(), args.len())
+                    .is_some_and(|n| n != args.len())
+                {
+                    return Err(PyValueError::new_err("metavariable has inconsistent arity"));
+                }
+            }
+            Kind::BVar(i) if *i >= depth => {
+                return Err(PyValueError::new_err(
+                    "bound variable is outside its binders",
+                ));
+            }
+            Kind::App(f, x) => {
+                f.validate(depth, vars, concrete)?;
+                x.validate(depth, vars, concrete)?;
+            }
+            Kind::Binder(_, body) => body.validate(depth + 1, vars, concrete)?,
+            _ => {}
+        }
+        Ok(())
     }
-    pub fn app(f: Term, x: Term) -> Self {
-        Term::App(Box::new(f), Box::new(x))
-    }
-    pub fn app2(f: Term, x: Term, y: Term) -> Self {
-        Term::App(Box::new(Term::App(Box::new(f), Box::new(x))), Box::new(y))
-    }
-    pub fn app3(f: Term, x: Term, y: Term, z: Term) -> Self {
-        Term::App(
-            Box::new(Term::App(
-                Box::new(Term::App(Box::new(f), Box::new(x))),
-                Box::new(y),
-            )),
-            Box::new(z),
-        )
-    }
-
-    pub fn lit(s: &str) -> Self {
-        Term::Lit(s.to_string())
+    fn required_context(&self) -> usize {
+        match &self.kind {
+            Kind::FVar(i) => i.saturating_add(1),
+            Kind::App(f, x) => f.required_context().max(x.required_context()),
+            Kind::Binder(_, body) => body.required_context(),
+            _ => 0,
+        }
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Node {
-    App(Id, Id),
     Var,
-    Lit(String),
-    UNode(Id, Id), // Maybe rawid because everything in eclass has same minimal context. No. rawid are terms which have a very concrete
+    Atom(String),
+    App(Id, Id),
+    Binder(String, Id),
+}
+type Subst = HashMap<String, Id>;
+
+/// Find every W for which W.compose(edge) == target. A redundant edge may
+/// admit several W, corresponding to different variables in the target.
+/// Unlike `factor`, which fixes the outer injection, this fixes the inner one:
+/// edge=[true,false], target=[true,false,false] admits W=[true,true,false]
+/// and W=[true,false,true]. Both compose with edge to give target.
+/// E-matching needs all these placements when traversing redundant edges.
+fn factors(target: &Thin, edge: &Thin) -> Vec<Thin> {
+    fn visit(
+        target: &Thin,
+        edge: &Thin,
+        index: usize,
+        start: usize,
+        bits: &mut Vec<bool>,
+        out: &mut Vec<Thin>,
+    ) {
+        if index == edge.cod() {
+            let by = Thin::new(bits.clone());
+            if by.comp(edge) == *target {
+                out.push(by);
+            }
+            return;
+        }
+        let remaining = edge.cod() - index - 1;
+        for i in start..target.cod().saturating_sub(remaining) {
+            if target.bits[i] == edge.bits[index] {
+                bits[i] = true;
+                visit(target, edge, index + 1, i + 1, bits, out);
+                bits[i] = false;
+            }
+        }
+    }
+    if target.dom() != edge.dom() || target.cod() < edge.cod() {
+        return vec![];
+    }
+    if edge.bits.iter().all(|&b| b) {
+        return vec![target.clone()];
+    }
+    let mut out = vec![];
+    visit(target, edge, 0, 0, &mut vec![false; target.cod()], &mut out);
+    out
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[pyclass(module = "microegg.thin")]
+#[derive(Default)]
 pub struct EGraph {
-    memo: HashMap<Node, Id>,
-    nodes: Vec<Node>,
-    uf: Vec<Id>,
-    minctx: Vec<usize>,
-}
-pub fn varid() -> Id {
-    Id(Thin::id(1), 0)
+    parent: Vec<Id>,
+    memo: IndexMap<Node, usize>,
+    // Rebuilt index: root class -> enodes and placements of that class in each enode.
+    rev: IndexMap<usize, Vec<(Node, Thin)>>,
+    rules: Vec<(Term, Term)>,
 }
 
 impl EGraph {
-    pub fn new() -> Self {
-        let mut memo = HashMap::new();
-        memo.insert(Node::Var, varid());
-        EGraph {
-            memo,
-            nodes: vec![Node::Var],
-            uf: vec![varid()],
-            minctx: vec![1],
+    fn check(&self, id: &Id) -> PyResult<()> {
+        if self
+            .parent
+            .get(id.raw)
+            .is_none_or(|origin| origin.ctx() != id.thinning.dom())
+        {
+            return Err(PyValueError::new_err("invalid graph-local scoped ID"));
         }
+        Ok(())
     }
-
-    fn add_node(&mut self, ctx: usize, n: Node) -> Id {
-        if let Some(id) = self.memo.get(&n) {
-            self.find(id)
-        } else {
-            let id = Id(Thin::id(ctx), self.uf.len());
-            self.uf.push(id.clone());
-            self.nodes.push(n.clone());
-            self.memo.insert(n, id.clone());
-            self.minctx.push(ctx);
-            id
+    fn make_set(&mut self, ctx: usize) -> Id {
+        let id = Id::new(self.parent.len(), Thin::identity(ctx));
+        self.parent.push(id.clone());
+        id
+    }
+    fn origin(&self, raw: usize) -> Id {
+        Id::new(raw, Thin::identity(self.parent[raw].ctx()))
+    }
+    fn root(&self, id: &Id) -> Id {
+        let mut out = id.clone();
+        while self.parent[out.raw].raw != out.raw {
+            let edge = &self.parent[out.raw];
+            out = edge.lift(&out.thinning);
         }
+        out
     }
-
-    pub fn app(&mut self, f: Id, x: Id) -> Id {
-        assert_eq!(f.ctx(), x.ctx());
-        let f = self.find(&f);
-        let x = self.find(&x);
-        // Construct the app in the smallest common needed context
-        let (common, f1thin, x1thin) = f.0.join(&x.0);
-        let id = self.add_node(common.cod(), Node::App(Id(f1thin, f.1), Id(x1thin, x.1)));
-        // Lift back into context actually requested
-        id.weaken(&common)
-    }
-    /*
-    pub fn app_beta(&mut self, f : Id, x : Id) -> Id
-    {
-        for id in self.enodes(f.rawid) {
-            if let Node::Lam(body) = self.nodes[id] {
-            return self.subst(&body, 0, &x);
-            }
-        }
-        self.app(f,x);
-    }
-     */
-
-    pub fn var(&self) -> Id {
-        varid()
-    }
-
-    pub fn lit(&mut self, s: impl AsRef<str>) -> Id {
-        self.add_node(0, Node::Lit(s.as_ref().to_owned()))
-    }
-
-    pub fn find(&self, id: &Id) -> Id {
-        let Id(mut thin, mut rawid) = id.clone();
+    // Shorten union-find paths while composing their context annotations.
+    // Read-only matching uses root(); construction keeps its paths short here.
+    fn root_mut(&mut self, id: &Id) -> Id {
+        let mut raw = id.raw;
         loop {
-            let Id(thin1, rawid1) = self.uf[rawid].clone();
-            if rawid1 == rawid {
-                assert!(thin1.is_id());
-                return Id(thin, rawid);
-            } else {
-                thin = thin.comp(&thin1);
-                rawid = rawid1;
+            let parent = self.parent[raw].raw;
+            if self.parent[parent].raw == parent {
+                break;
+            }
+            let edge = self.parent[raw].clone();
+            self.parent[raw] = self.parent[parent].lift(&edge.thinning);
+            raw = parent;
+        }
+        self.root(id)
+    }
+    fn intern(&mut self, ctx: usize, node: Node) -> Id {
+        if let Some(&raw) = self.memo.get(&node) {
+            return self.root_mut(&self.origin(raw));
+        }
+        let id = self.make_set(ctx);
+        self.memo.insert(node, id.raw);
+        id
+    }
+    fn variable(&mut self, ctx: usize, level: usize) -> Id {
+        self.intern(1, Node::Var)
+            .lift(&Thin::select(ctx, level).unwrap())
+    }
+    fn literal(&mut self, name: &str, ctx: usize) -> Id {
+        self.intern(0, Node::Atom(name.into()))
+            .lift(&Thin::unused(ctx))
+    }
+    /// Return the pulled e-node and the thinning back to its original context.
+    /// Intern only the dependencies used by its children; the returned
+    /// placement restores unused variables in the caller's ambient context.
+    fn canonicalize(&mut self, node: &Node) -> (Thin, Node) {
+        match node {
+            Node::Var => (Thin::identity(1), Node::Var),
+            Node::Atom(name) => (Thin::identity(0), Node::Atom(name.clone())),
+            Node::App(f, x) => {
+                let (f, x) = (self.root_mut(f), self.root_mut(x));
+                let common = f.thinning.join(&x.thinning);
+                let f = Id::new(f.raw, common.factor(&f.thinning).unwrap());
+                let x = Id::new(x.raw, common.factor(&x.thinning).unwrap());
+                (common, Node::App(f, x))
+            }
+            Node::Binder(op, body) => {
+                let body = self.root_mut(body);
+                let outer = Thin::new(body.thinning.bits[..body.ctx() - 1].to_vec());
+                let inner = Thin::identity(outer.dom()).append(*body.thinning.bits.last().unwrap());
+                (outer, Node::Binder(op.clone(), Id::new(body.raw, inner)))
             }
         }
     }
-
-    pub fn is_eq(&mut self, a: &Id, b: &Id) -> bool {
-        self.find(a) == self.find(b)
+    fn application(&mut self, f: Id, x: Id) -> Id {
+        let (by, node) = self.canonicalize(&Node::App(f, x));
+        self.intern(by.dom(), node).lift(&by)
     }
-
-    //pub fn user_union(ctx : &[String], a : UserId, b : UserId) {}
-    fn union(&mut self, a: &Id, b: &Id) -> bool {
-        assert_eq!(a.ctx(), b.ctx(), "Can only union ids in the same context");
-        let a = self.find(a);
-        let b = self.find(b);
+    fn binding(&mut self, op: &str, body: Id) -> Id {
+        let (by, node) = self.canonicalize(&Node::Binder(op.into(), body));
+        self.intern(by.dom(), node).lift(&by)
+    }
+    fn merge(&mut self, a: &Id, b: &Id) -> bool {
+        debug_assert_eq!(a.ctx(), b.ctx());
+        let (a, b) = (self.root_mut(a), self.root_mut(b));
         if a == b {
-            false
+            return false;
         }
-        /*
-        // TODO: We can avoid making a new rawid in many cases (?) But unodes?
-        else if a.0 == b.0 && a.0.is_id() {
-            self.uf[a.1] =
+        if a.raw == b.raw {
+            // Equating two placements of one class restricts that class to
+            // the context variables on which the placements agree. For example,
+            // f(x) = f(y) turns the result of f into a context-independent
+            // value rather than treating x and y themselves as equal.
+            let dependency = a.thinning.equalizer(&b.thinning);
+            let root = self.make_set(dependency.dom());
+            self.parent[a.raw] = Id::new(root.raw, dependency);
+        } else {
+            let (common, left, right) = a.thinning.meet(&b.thinning);
+            if common == b.thinning {
+                self.parent[a.raw] = Id::new(b.raw, left);
+            } else if common == a.thinning {
+                self.parent[b.raw] = Id::new(a.raw, right);
+            } else {
+                let root = self.make_set(common.dom());
+                self.parent[a.raw] = Id::new(root.raw, left);
+                self.parent[b.raw] = Id::new(root.raw, right);
+            }
         }
-        else if a.0 <= b.0{
+        true
+    }
+    fn nodes_in_class(&self, target: &Id) -> Vec<(&Node, Thin)> {
+        let target = self.root(target);
+        self.rev
+            .get(&target.raw)
+            .into_iter()
+            .flatten()
+            .flat_map(|(node, edge)| {
+                factors(&target.thinning, edge)
+                    .into_iter()
+                    .map(move |by| (node, by))
+            })
+            .collect()
+    }
+    // `ambient_ctx` counts variables outside the pattern; `current_ctx` also
+    // includes its local binders. Captures retain the ambient context implicitly
+    // and only the local binders selected by their Miller parameters.
+    // https://www.philipzucker.com/ho_unify/
+    fn occurrence(ambient_ctx: usize, current_ctx: usize, args: &[usize]) -> Thin {
+        let mut bits = vec![false; current_ctx];
+        bits[..ambient_ctx].fill(true);
+        for &index in args {
+            bits[current_ctx - 1 - index] = true;
         }
-        else if
-        }*/
-        else {
-            let (common, proj_a, proj_b) = Thin::meet(&a.0, &b.0);
-            let Id(_, rawz) = self.add_node(
-                common.cod(),
-                Node::UNode(Id(proj_a.clone(), a.1), Id(proj_b.clone(), b.1)),
-            );
-            self.uf[a.1] = Id(proj_a, rawz);
-            self.uf[b.1] = Id(proj_b, rawz);
-            true
+        Thin::new(bits)
+    }
+    fn matches(&self, pattern: &Term, target: &Id, subst: Subst, ambient_ctx: usize) -> Vec<Subst> {
+        if let Kind::Meta(name, args) = &pattern.kind {
+            let occurrence = Self::occurrence(ambient_ctx, target.ctx(), args);
+            let target = self.root(target);
+            let mut subst = subst;
+            if let Some(old) = subst.get(name) {
+                if self.root(&old.lift(&occurrence)) != target {
+                    return vec![];
+                }
+            } else {
+                let Some(by) = occurrence.factor(&target.thinning) else {
+                    return vec![];
+                };
+                subst.insert(name.clone(), Id::new(target.raw, by));
+            }
+            return vec![subst];
+        }
+        let mut out = vec![];
+        for (node, by) in self.nodes_in_class(target) {
+            match (&pattern.kind, node) {
+                (Kind::Atom(a), Node::Atom(b)) if a == b => out.push(subst.clone()),
+                (Kind::FVar(i), Node::Var) if by == Thin::select(target.ctx(), *i).unwrap() => {
+                    out.push(subst.clone())
+                }
+                (Kind::BVar(i), Node::Var)
+                    if by == Thin::select(target.ctx(), target.ctx() - 1 - i).unwrap() =>
+                {
+                    out.push(subst.clone())
+                }
+                (Kind::App(pf, px), Node::App(f, x)) => {
+                    for s in self.matches(pf, &f.lift(&by), subst.clone(), ambient_ctx) {
+                        out.extend(self.matches(px, &x.lift(&by), s, ambient_ctx));
+                    }
+                }
+                (Kind::Binder(a, p), Node::Binder(b, body)) if a == b => {
+                    out.extend(self.matches(
+                        p,
+                        &body.lift(&by.append(true)),
+                        subst.clone(),
+                        ambient_ctx,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+    fn instantiate(
+        &mut self,
+        term: &Term,
+        current_ctx: usize,
+        ambient_ctx: usize,
+        subst: &Subst,
+    ) -> Id {
+        match &term.kind {
+            Kind::Meta(name, args) => {
+                self.root(&subst[name].lift(&Self::occurrence(ambient_ctx, current_ctx, args)))
+            }
+            Kind::Atom(name) => self.literal(name, current_ctx),
+            Kind::FVar(i) => self.variable(current_ctx, *i),
+            Kind::BVar(i) => self.variable(current_ctx, current_ctx - 1 - i),
+            Kind::App(f, x) => {
+                let f = self.instantiate(f, current_ctx, ambient_ctx, subst);
+                let x = self.instantiate(x, current_ctx, ambient_ctx, subst);
+                self.application(f, x)
+            }
+            Kind::Binder(op, body) => {
+                let body = self.instantiate(body, current_ctx + 1, ambient_ctx, subst);
+                self.binding(op, body)
+            }
         }
     }
+}
 
-    pub fn rebuild(&mut self) {
+#[pymethods]
+impl EGraph {
+    #[new]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn var(&mut self, ctx: usize, level: usize) -> PyResult<Id> {
+        Thin::select(ctx, level)?;
+        Ok(self.variable(ctx, level))
+    }
+    #[pyo3(signature = (name, ctx = 0))]
+    pub fn atom(&mut self, name: &str, ctx: usize) -> Id {
+        self.literal(name, ctx)
+    }
+    pub fn app(&mut self, function: &Id, argument: &Id) -> PyResult<Id> {
+        self.check(function)?;
+        self.check(argument)?;
+        if function.ctx() != argument.ctx() {
+            return Err(PyValueError::new_err(
+                "application requires a shared context",
+            ));
+        }
+        Ok(self.application(function.clone(), argument.clone()))
+    }
+    pub fn binder(&mut self, op: &str, body: &Id) -> PyResult<Id> {
+        self.check(body)?;
+        if body.ctx() == 0 {
+            return Err(PyValueError::new_err(
+                "binder body needs at least one context variable",
+            ));
+        }
+        Ok(self.binding(op, body.clone()))
+    }
+    #[pyo3(signature = (term, ctx = 0))]
+    pub fn add(&mut self, term: &Term, ctx: usize) -> PyResult<Id> {
+        term.validate(0, &mut HashMap::new(), true)?;
+        if term.required_context() > ctx {
+            return Err(PyValueError::new_err(
+                "free variable is outside the ambient context",
+            ));
+        }
+        Ok(self.instantiate(term, ctx, ctx, &Subst::new()))
+    }
+    pub fn find(&self, id: &Id) -> PyResult<Id> {
+        self.check(id)?;
+        Ok(self.root(id))
+    }
+    pub fn union(&mut self, a: &Id, b: &Id) -> PyResult<bool> {
+        self.check(a)?;
+        self.check(b)?;
+        if a.ctx() != b.ctx() {
+            return Err(PyValueError::new_err("equality requires a shared context"));
+        }
+        Ok(self.merge(a, b))
+    }
+    pub fn is_eq(&mut self, a: &Id, b: &Id) -> PyResult<bool> {
+        self.check(a)?;
+        self.check(b)?;
+        self.rebuild();
+        Ok(self.root(a) == self.root(b))
+    }
+    pub fn rebuild(&mut self) -> bool {
+        let mut changed = false;
         loop {
-            let mut done = true;
-            for i in 0..self.nodes.len() {
-                let node = &self.nodes[i];
-                let id = self.find(&self.uf[i]);
-                match node {
-                    Node::Lit(_) => {}
-                    Node::Var => {}
-                    Node::UNode(_, _) => {}
-                    /*
-                    Node::Lam { var_used, rawid } => {
-                        panic!("unimplemented");
-                        //let id1 = self.lam(Id(, rawid));
-                        //done &= !self.union(&id, &id1);
-                    } */
-                    Node::App(f, x) => {
-                        let id1 = self.app(f.clone(), x.clone());
-                        done &= !self.union(&id, &id1);
+            let mut merged = false;
+            for (node, raw) in std::mem::take(&mut self.memo) {
+                let old = self.origin(raw);
+                let (by, canonical) = self.canonicalize(&node);
+                changed |= by != Thin::identity(old.ctx()) || canonical != node;
+                let base = if let Some(&existing) = self.memo.get(&canonical) {
+                    self.root(&self.origin(existing))
+                } else if by == Thin::identity(old.ctx()) {
+                    self.memo.insert(canonical, raw);
+                    old.clone()
+                } else {
+                    self.intern(by.dom(), canonical)
+                };
+                merged |= self.merge(&old, &base.lift(&by));
+            }
+            changed |= merged;
+            if !merged {
+                break;
+            }
+        }
+        self.rev.clear();
+        for (node, &raw) in &self.memo {
+            let edge = self.root(&self.origin(raw));
+            self.rev
+                .entry(edge.raw)
+                .or_default()
+                .push((node.clone(), edge.thinning));
+        }
+        changed
+    }
+    pub fn ematch(&mut self, pattern: &Term, target: &Id) -> PyResult<Vec<Subst>> {
+        self.check(target)?;
+        pattern.validate(0, &mut HashMap::new(), false)?;
+        if pattern.required_context() > target.ctx() {
+            return Err(PyValueError::new_err(
+                "free variable is outside the ambient context",
+            ));
+        }
+        self.rebuild();
+        Ok(self.matches(pattern, target, Subst::new(), target.ctx()))
+    }
+    pub fn add_rule(&mut self, lhs: Term, rhs: Term) -> PyResult<()> {
+        let (mut left, mut right) = (HashMap::new(), HashMap::new());
+        lhs.validate(0, &mut left, false)?;
+        rhs.validate(0, &mut right, false)?;
+        if right
+            .iter()
+            .any(|(name, arity)| left.get(name) != Some(arity))
+        {
+            return Err(PyValueError::new_err(
+                "RHS metavariables must be bound on the LHS with the same arity",
+            ));
+        }
+        self.rules.push((lhs, rhs));
+        Ok(())
+    }
+    pub fn run(&mut self, limit: usize) -> usize {
+        // Borrow each RHS from one rule snapshot instead of cloning it per match.
+        let rules = self.rules.clone();
+        self.rebuild();
+        for round in 0..limit {
+            let mut targets = HashSet::new();
+            for &raw in self.memo.values() {
+                targets.insert(self.root(&self.origin(raw)));
+            }
+            let mut targets: Vec<_> = targets.into_iter().collect();
+            targets.sort_by(|a, b| (a.raw, &a.thinning.bits).cmp(&(b.raw, &b.thinning.bits)));
+            let mut matches = vec![];
+            for (lhs, rhs) in &rules {
+                for target in &targets {
+                    if lhs.required_context().max(rhs.required_context()) <= target.ctx() {
+                        for subst in self.matches(lhs, target, Subst::new(), target.ctx()) {
+                            matches.push((target.clone(), rhs, subst));
+                        }
                     }
                 }
             }
-            if done {
-                return;
+            let mut changed = false;
+            for (target, rhs, subst) in matches {
+                let replacement = self.instantiate(rhs, target.ctx(), target.ctx(), &subst);
+                changed |= self.merge(&target, &replacement);
+            }
+            changed |= self.rebuild();
+            if !changed {
+                return round + 1;
             }
         }
+        limit
     }
-
-    // I maybe suspect this should just be what happens when you hit a unode in ematching.
-
-    fn all_liftable_node_ids(&self, id0: &Id) -> Vec<Id> {
-        /*
-        We find to rawid with smallest minctx and seek out all rawids that can be lifted into the requested context
-        We then ave to reconcile all the ways there other thing may have to be fit into the larger context
-        */
-        let id0 = self.find(id0);
-        let mut res = vec![];
-        let ctx = id0.ctx();
-        let thin0 = id0.0;
-        let mut todo = vec![Id(Thin::id(thin0.cod()), id0.1)];
-        while let Some(Id(thin, rawid)) = todo.pop() {
-            match &self.nodes[rawid] {
-                Node::UNode(a, b) => {
-                    if a.ctx() <= ctx {
-                        todo.push(Id(a.0.comp(&thin), a.1)); // This composition is in the opposite direction of weakening
-                    }
-                    if b.ctx() <= ctx {
-                        todo.push(Id(b.0.comp(&thin), b.1));
-                    }
-                }
-                _ => res.extend(
-                    thin0
-                        .all_comm_triangles(&thin)
-                        .into_iter()
-                        .map(|thin1| Id(thin1, rawid)),
-                ),
-            }
-        }
-        res
+    /// Extract a least node-count finite term, preserving the requested scope.
+    pub fn extract(&mut self, target: &Id) -> PyResult<(usize, Term)> {
+        self.check(target)?;
+        self.rebuild();
+        extract::extract(self, target)
     }
-
-    fn ematch(&self, pat: &Term, id: &Id) -> Vec<()> {
-        let res = vec![];
-        for id1 in self.all_liftable_node_ids(id) {
-            let node = &self.nodes[id1.1];
-            match (pat, node) {
-                (Term::App(f, x), Node::App(f1, x1)) => {}
-                //(Term::Lam(v, body), Node::Lam { var_used, rawid }) => {}
-                (Term::Lit(l), Node::Lit(l1)) => {}
-                (Term::Var(v), Node::Var) => {}
-                (_, _) => {} // Term::EId(id1), _ =>
-            }
-        }
-        res
+    pub fn num_classes(&self) -> usize {
+        self.parent
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| *i == p.raw)
+            .count()
     }
-
-    pub fn add_term(&mut self, ctx: &[String], t: &Term) -> Id {
-        match t {
-            Term::App(f, x) => {
-                let f = self.add_term(ctx, f);
-                let x = self.add_term(ctx, x);
-                self.app(f, x)
-            }
-            Term::Lit(l) => self.lit(l.clone()).weaken(&Thin::unused(ctx.len())),
-            Term::Var(x) => {
-                let idx = ctx.iter().position(|y| y == x).unwrap();
-                varid().weaken(&Thin::select(ctx.len(), idx))
-            }
-            Term::EId(eid) => eid.clone(),
-        }
+    pub fn node_count(&self) -> usize {
+        self.memo.len()
     }
+}
+
+#[pymodule(name = "thin", submodule)]
+pub mod python {
+    #[pymodule_export]
+    use super::{EGraph, Id, Term, Thin};
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*; // Import names from parent module
-    #[test]
-    fn test_thin() {
-        assert!(Thin::id(3).dom() == 3);
-        assert!(Thin::id(3).cod() == 3);
-        let t1 = Thin(vec![true, false, true]);
-        assert!(&Thin::id(3).comp(&t1) == &t1);
-        assert!(&t1.comp(&Thin::id(2)) == &t1);
-    }
+    use super::*;
 
-    #[test]
-    fn test_all_comm_triangles_no_extra_holes() {
-        let self_ = Thin(vec![true, false, true]);
-        let other = Thin(vec![true, true]);
-
-        let triangles = self_.all_comm_triangles(&other);
-
-        assert_eq!(triangles, vec![self_.clone()]);
-        assert!(triangles.iter().all(|t| t.comp(&other) == self_));
-    }
-
-    #[test]
-    fn test_all_comm_triangles_choose_one_extra_hole() {
-        let self_ = Thin(vec![true, false, true, false]);
-        let other = Thin(vec![true, false, true]);
-
-        let mut triangles = self_.all_comm_triangles(&other);
-        triangles.sort_by_key(|t| t.0.clone());
-
-        assert_eq!(triangles, vec![Thin(vec![true, true, true, false])]);
-        assert!(triangles.iter().all(|t| t.comp(&other) == self_));
-    }
-
-    #[test]
-    fn test_all_comm_triangles_choose_two_extra_holes() {
-        let self_ = Thin(vec![true, false, false, false, true]);
-        let other = Thin(vec![true, false, false, true]);
-
-        let triangles = self_.all_comm_triangles(&other);
-
-        assert_eq!(triangles.len(), 3);
-        assert!(triangles.iter().all(|t| t.dom() == self_.dom()));
-        assert!(triangles.iter().all(|t| t.cod() == other.dom()));
-        assert!(triangles.iter().all(|t| t.comp(&other) == self_));
-        assert!(triangles.contains(&Thin(vec![true, true, false, true, true])));
-        assert!(triangles.contains(&Thin(vec![true, true, true, false, true])));
-        assert!(triangles.contains(&Thin(vec![true, false, true, true, true])));
-    }
-
-    #[test]
-    fn test_egraph() {
-        let mut g = EGraph::new();
-        let x = g.var();
-        let y = g.var();
-        assert!(x.ctx() == 1);
-
-        //let x1 = g.add_term(&["x".to_string()], Term::Var("x".to_string()));
-
-        let x1 = g.add_term(&["x".to_string()], &Term::Var("x".to_string()));
-        //assert!(x1.0 == vec!["x".to_string()]);
-        //assert!(x1.1 == x);
-
-        let x1 = g.add_term(
-            &["x".to_string(), "y".to_string()],
-            &Term::Var("x".to_string()),
-        );
-        assert_eq!(x1.0.0, vec![true, false]);
-        //assert_eq!(x1.0, vec!["x".to_string(), "y".to_string()]);
-        let id1 = g.app(x.clone(), y.clone());
-        let id2 = g.app(x.clone(), y.clone());
-        assert!(id1 == id2);
-        assert!(id1.ctx() == 1);
-
-        let a = g.lit("a".to_string());
-        let b = g.lit("b".to_string());
-        assert!(a != b);
-
-        let a1 = g.add_term(&[], &Term::Lit("a".to_string()));
-        assert_eq!(a, a1);
-        //assert!(a1.1 == a);
-
-        let ab = g.app(a.clone(), b.clone());
-        assert!(ab.ctx() == 0);
-
-        /*
-
-        Add back when we return to lambda
-        let (emp, id1) = g.add_term(
-            &[],
-            Term::Lam("x".to_string(), Box::new(Term::Var("x".to_string()))),
-        );
-        assert_eq!(emp.len(), 0);
-        let (emp, id2) = g.add_term(
-            &[],
-            Term::Lam("y".to_string(), Box::new(Term::Var("y".to_string()))),
-        );
-        assert_eq!(emp.len(), 0);
-        assert_eq!(id1, id2);
-
-        let c1 = g.add_term(
-            &["x".to_string()],
-            Term::Lam("y".to_string(), Box::new(Term::Var("x".to_string()))),
-        );
-
-        assert_eq!(c1.0, vec!["x".to_string()]);
-        dbg!("{}", &c1);
-        assert_eq!(c1.1.ctx(), 1);
-        //let c2 = g.add_term(&[], Term.Lam("x".to_string(), Box::new(c1.1)));
-
-        let const1 = g.add_term(
-            &[],
-            Term::Lam(
-                "x".to_string(),
-                Box::new(Term::Lam(
-                    "y".to_string(),
-                    Box::new(Term::Var("x".to_string())),
-                )),
-            ),
-        );
-        let const2 = g.add_term(
-            &[],
-            Term::Lam(
-                "a".to_string(),
-                Box::new(Term::Lam(
-                    "b".to_string(),
-                    Box::new(Term::Var("a".to_string())),
-                )),
-            ),
-        );
-        assert_eq!(
-            const1.1, const2.1,
-            "alpha equivalent terms should map to same id"
-        );
-        */
-
-        let c1 = g.add_term(&[], &Term::Lit("c".to_string()));
-        let c2 = g.add_term(&[], &Term::Lit("c1".to_string()));
-        assert!(c1 != c2);
-        assert!(!g.is_eq(&c1, &c2));
-        assert_eq!(g.all_liftable_node_ids(&c1).len(), 1);
-        assert!(g.union(&c1, &c2));
-        assert_eq!(g.all_liftable_node_ids(&c1).len(), 2);
-        assert!(g.is_eq(&c1, &c2));
-
-        let plusab = g.add_term(
-            &["a".to_string(), "b".to_string()],
-            &Term::App(
-                Box::new(Term::App(
-                    Box::new(Term::Lit("+".to_string())),
-                    Box::new(Term::Var("a".to_string())),
-                )),
-                Box::new(Term::Var("b".to_string())),
-            ),
-        );
-        let plusba = g.add_term(
-            &["a".to_string(), "b".to_string()],
-            &Term::App(
-                Box::new(Term::App(
-                    Box::new(Term::Lit("+".to_string())),
-                    Box::new(Term::Var("b".to_string())),
-                )),
-                Box::new(Term::Var("a".to_string())),
-            ),
-        );
-        assert!(!g.is_eq(&plusab, &plusba));
-        assert!(g.union(&plusab, &plusba));
-        let newid = g.find(&plusab);
-        assert!(g.is_eq(&plusab, &plusba));
-
-        let n_nodes = g.nodes.len();
-        // A construction macro would be killer.
-        let plusxy = g.add_term(
-            &["x".to_string(), "y".to_string()],
-            &Term::app2(Term::lit("+"), Term::var("x"), Term::var("y")),
-        );
-        assert_eq!(g.nodes.len(), n_nodes, "Should hit the memo");
-        assert_eq!(plusxy.0.0, vec![true, true]);
-        assert_eq!(plusxy, newid, "finds to newid");
-        assert!(g.is_eq(&plusxy, &plusab), "Should be equal to plusab");
-
-        assert_eq!(
-            g.all_liftable_node_ids(&plusab).len(),
-            2,
-            "Should have two nodes in class",
-        );
-
-        let mut g = EGraph::new();
-        let xzero = g.add_term(
-            &["x".to_string()],
-            &Term::app2(Term::lit("+"), Term::var("x"), Term::lit("zero")),
-        );
-        assert_eq!(xzero.0.0, vec![true]);
-        let zero = g.add_term(&["x".to_string()], &Term::lit("zero"));
-        assert_eq!(zero.0.0, vec![false]);
-        assert_eq!(zero.ctx(), 1);
-        // Hmm. unon a different contexts _could_ mean kill. But
-        //g.union(&zero.1, &xzero.1);
-        g.union(&zero, &xzero);
-        let zero1 = g.find(&zero);
-        assert_eq!(zero1.0.cod(), 0);
-        let zero2 = g.find(&xzero);
-        assert_eq!(zero2.0.cod(), 0);
-
-        assert_eq!(zero1, zero2);
-
-        //assert_eq!(g.nodes_in_class(&zero2.1).len(), 2);
-        assert_eq!(g.all_liftable_node_ids(&Id(Thin::id(0), zero.1)).len(), 1);
-
-        // Or is this just wrong. We should never be calling app on something that has
-        // Widening should commute with app  app(f,x).wide() == app(f.wide(), x.wide())
-        // It should also commute with lam.
-
-        /*
-
-        let a0 = g.add_term(&[], Term::lit("a"));
-        let wa = a0.1.widen(&Thin(vec![false])); // widen to a context with one variable that is not used
-        let fa0 = g.add_term(&[], Term::app(Term::lit("f"), Term::EId(a0.1)));
-        let fa1 = g.add_term(&["x".to_string()], Term::app(Term::lit("f"), Term::EId(wa)));
-        assert_eq!(fa0.1, fa1.1, "Widening should commute with app");
-        assert_eq!(fa0.0.len(), 0, "fa0 should have empty minctx");
-        assert_eq!(fa1.0.len(), 0, "fa1 should have empty minctx");
-
-        */
-    }
-}
-
-mod named {
-    use super::Debug;
-    use super::Thin;
-    use super::zip;
-
-    // Working with named contexts
-    pub fn is_subseq<T: Eq>(big: &[T], small: &[T]) -> Option<Thin> {
-        //! Compute the thinning witness of extracting small from big if it exists.
-        let mut res = Vec::with_capacity(big.len());
-        let mut j = 0;
-        for i in big.iter() {
-            if j < small.len() && i == &small[j] {
-                res.push(true);
-                j += 1;
-            } else {
-                res.push(false);
-            }
-        }
-        if j == small.len() {
-            Some(Thin(res))
-        } else {
-            None
-        }
-    }
-
-    pub fn apply_thin<T: Clone>(thin: &Thin, big: &[T]) -> Vec<T> {
-        //! Apply a thinning to a big context to get the small context.
-        assert_eq!(thin.dom(), big.len());
-        zip(thin.0.iter(), big.iter())
-            .filter(|(b, _)| **b)
-            .map(|(_, x)| x.clone())
+    fn thins(n: usize) -> Vec<Thin> {
+        (0..1usize << n)
+            .map(|mask| Thin::new((0..n).map(|i| mask & (1 << i) != 0).collect()))
             .collect()
     }
 
-    // This is the named version of pullback?
-    pub fn common_minctx<T: Eq + Clone + Debug>(
-        big: &[T],
-        small1: &[T],
-        small2: &[T],
-    ) -> (Vec<T>, Thin, Thin) {
-        //! From a maximal context and two needed contexts, find the smallest combo context and thinnning
-        //! small1 = thin @ minctx
-        //! small2 = thin @ minctx
-        //! maxctx is needed to know how to interleave small1 and small2
-        // assert!(is_subseq(big, small1).is_some() && is_subseq(big, small2).is_some()); // I guess the end check is also doing this
-        let mut wide1 = vec![];
-        let mut wide2 = vec![];
-        let mut minctx: Vec<T> = vec![];
-        let mut n1 = 0;
-        let mut n2 = 0;
-        // Reconcile the two minimal contexts. A sorted union
-        for s in big.iter() {
-            let take1 = n1 < small1.len() && small1[n1] == *s;
-            let take2 = n2 < small2.len() && small2[n2] == *s;
-            if take1 {
-                n1 += 1;
-            }
-            if take2 {
-                n2 += 1;
-            }
-            if take1 || take2 {
-                minctx.push(s.clone());
-                wide1.push(take1);
-                wide2.push(take2);
+    #[test]
+    fn exhaustive_small_thinning_laws() {
+        for n in 0..=5 {
+            for a in thins(n) {
+                assert_eq!(Thin::identity(n).comp(&a), a);
+                assert_eq!(a.comp(&Thin::identity(a.dom())), a);
+                for b in thins(n) {
+                    let (common, left, right) = a.meet(&b);
+                    assert_eq!(a.comp(&left), common);
+                    assert_eq!(b.comp(&right), common);
+                    let joined = a.join(&b);
+                    assert_eq!(joined.comp(&joined.factor(&a).unwrap()), a);
+                    assert_eq!(joined.comp(&joined.factor(&b).unwrap()), b);
+                    if a.dom() == b.dom() {
+                        let equal = a.equalizer(&b);
+                        assert_eq!(a.comp(&equal), b.comp(&equal));
+                    }
+                }
+                for b in thins(a.dom()) {
+                    for c in thins(b.dom()) {
+                        assert_eq!(a.comp(&b).comp(&c), a.comp(&b.comp(&c)));
+                    }
+                }
             }
         }
-        assert_eq!(n1, small1.len());
-        assert_eq!(n2, small2.len());
-        assert_eq!(minctx.len(), wide1.len());
-        assert_eq!(minctx.len(), wide2.len());
-        (minctx, Thin(wide1), Thin(wide2))
+    }
+
+    #[test]
+    fn factor_enumeration_is_complete() {
+        for n in 0..=5 {
+            for m in 0..=n {
+                for target in thins(n) {
+                    for edge in thins(m) {
+                        let actual: HashSet<_> = factors(&target, &edge).into_iter().collect();
+                        let expected: HashSet<_> = thins(n)
+                            .into_iter()
+                            .filter(|by| by.dom() == m && by.comp(&edge) == target)
+                            .collect();
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn construction_handles_long_union_paths_without_recursion() {
+        let mut g = EGraph::new();
+        let first = g.atom("first", 0);
+        let mut last = first.clone();
+        for i in 0..10_000 {
+            let next = g.atom(&format!("a{i}"), 0);
+            g.union(&last, &next).unwrap();
+            last = next;
+        }
+        let f = g.atom("f", 0);
+        let old = g.app(&f, &first).unwrap();
+        let canonical = g.app(&f, &last).unwrap();
+        assert_eq!(old, canonical);
+    }
+
+    #[test]
+    fn union_shrinks_dependencies_and_rebuilds_binders() {
+        let mut g = EGraph::new();
+        let (x, y) = (g.var(2, 0).unwrap(), g.var(2, 1).unwrap());
+        let f = g.atom("f", 2);
+        let (fx, fy) = (g.app(&f, &x).unwrap(), g.app(&f, &y).unwrap());
+        let (lx, ly) = (g.binder("sum", &fx).unwrap(), g.binder("sum", &fy).unwrap());
+        assert_eq!(fx.raw, fy.raw);
+        g.union(&fx, &fy).unwrap();
+        assert!(g.rebuild());
+        assert!(!g.rebuild());
+        assert_eq!(g.find(&fx).unwrap().thinning, Thin::unused(2));
+        assert!(g.is_eq(&lx, &ly).unwrap());
     }
 }
-/*
-type UserId = (Vec<String>, Id);
-
-    pub fn named_union0(&mut self, a: UserId, b: UserId) -> Option<bool> {
-        // Result.
-        if a.0 == b.0 {
-            Some(self.union(&a.1, &b.1))
-        } else {
-            None
-        }
-    }
-    pub fn named_union(&mut self, ctx: &[String], a: UserId, b: UserId) -> bool {
-        let (minctx, thina, thinb) = named::common_minctx(ctx, &a.0, &b.0);
-        self.union(&a.1.weaken(&thina), &b.1.weaken(&thinb))
-    }
-    pub fn named_find(&self, nid: &UserId) -> UserId {
-        let id = self.find(&nid.1);
-        (named::apply_thin(&id.0, &nid.0), id)
-    }
-type TermInCtx = (Vec<String>, Term);
-
-    pub fn widen0(&self) -> Self {
-        //! Widen to a context with one more variable that is not used. Useful for lambda abstraction when the body doesn't use the bound var.
-        let mut thin = vec![false];
-        thin.extend(self.0.0.iter());
-        Id(Thin(thin), self.1)
-    }
-    fn dump0(&self) -> Self {
-        //! Dump the first variable in the context. Useful for lambda abstraction where lambdas create a variable in scope
-        let mut thin = self.0.clone();
-        thin.remove(0);
-        Thin(thin)
-    }
-
-    //pub fn lam(v: &str, body: Term) -> Self {
-    //    Term::Lam(v.to_string(), Box::new(body))
-    //}
-    /*
-    fn lam(&mut self, body: Id) -> Id {
-        assert!(
-            body.ctx() != 0,
-            "Body should have at least one variable in its context"
-        );
-        let body = self.find(&body);
-        let thin = body.0.dump0(); // the scope of the lambda is the minctx of the "body.remove(0)", since it hsouldn't matter if body used var or not.
-        // Also here. Everything in body should be true except _possibly_ the first value.
-        // TODO: No. This is wrong. I need to dump, then work in the smallest. Id(Thin::id(thin.cod()), body.1)
-        let id = self.add_node(
-            thin.cod(),
-            Node::Lam {
-                var_used: body.0.0[0],
-                rawid: body.1,
-            },
-        );
-        id.weaken(&thin) // I'm just composing an identity with a thinning. seems wasteful
-    }
-    */
-    /*
-    In minimal version ignore lambda?
-    */
-
-    /*
-    What I've done to ids is too funky. Now ids
-     */
-    // rebuild?
-    //fn subst(&mut self, s : &Id, v : usize, t : &Id) {}
-    // fn ematch
-    // fn beta() // scan just for beta redexes and subst them
-
-    // Hmm the isomorphism matching. That might be interesting.
-    //fn ematch(&self, )
-    // Lam { var_used: bool, rawid: RawId },
-    //Lam(Id), // Lam(var_used:bool, rawid : usize)
-    // Symbol? Constant.
-    // Value(Value)
-
-    // add_term is kind of named_add_node
-
-    fn add_term_helper(&mut self, maxctx: &[String], t: Term) -> UserId {
-        // Hmm. UserId could be a thinning from maxctx.
-        match t {
-            Term::Var(s) => (vec![s], self.var()), //  (maxctx.map(|name| name == s), self.var()
-            Term::Lit(s) => (vec![], self.lit(s)),
-            Term::App(f, x) => {
-                let (fctx, fid) = self.add_term_helper(maxctx, *f);
-                let (xctx, xid) = self.add_term_helper(maxctx, *x);
-                let (minctx, widef, widex) = named::common_minctx(maxctx, &fctx, &xctx);
-                // Hmm. What if add_node returns less than I thought? I should thin minctx
-                (minctx, self.app(fid.weaken(&widef), xid.weaken(&widex)))
-            }
-            /*
-            Term::Lam(v, body) => {
-                // Search for shadowed x and remove it
-                let mut bodymaxctx = maxctx.to_vec();
-                if let Some(pos) = maxctx.iter().position(|s| *s == v) {
-                    bodymaxctx.remove(pos);
-                }
-                // v is now available in the body in position 0. Should I reverse the direction I do this?
-                bodymaxctx.insert(0, v.clone()); // [x,y,z] -> [v, x,y,z]
-                let (mut bodyminctx, mut bid) = self.add_term_helper(&bodymaxctx, *body);
-                if bodyminctx.len() == 0 || bodyminctx[0] != v {
-                    // If the body doesn't use the variable, we need to pad with a false to kill the variable the lambda introduces.
-                    bid = bid.widen0(); // [true, false] -> [false, true, false]
-                } else {
-                    // If the body does use the bound var, the lam_minctx doesn't have it
-                    bodyminctx.remove(0); // [v, x] -> [x]
-                }
-                (bodyminctx, self.lam(bid))
-            }
-            */
-            Term::EId(id) => {
-                assert!(id.ctx() <= maxctx.len());
-                //  = is_ssubseq(maxctx ,id.1).unwrap()
-                (named::apply_thin(&id.0, maxctx), id)
-            }
-        }
-    }
-
-    pub fn add_term(&mut self, ctx: &[String], t: Term) -> UserId {
-        // Make Result.
-        let (minctx, id) = self.add_term_helper(ctx, t);
-        let thin = named::is_subseq(ctx, &minctx).unwrap();
-        (ctx.to_vec(), id.weaken(&thin))
-    }
-        /*
-                // do find?
-        // scan f for lambda? smart constructor loop might terminate?
-        // add app node version, only subst version, do both
-
-        // fthin :  [false, true, false]  : 3 -> 1
-        // xthin :  [false, false, true] : 3 -> 1
-        // common_thin : [false, true, true] : 3 -> 2
-        // common_thin.conj().comp(common_thin) != id ...? Wha? Is this make any sense at all?
-        // common_thin.conj().(fthin) = proj_fthin : [true, false] : 2 -> 1 // projected to common needed context
-        // proj_xthin : [false, true] // projected common needed context
-        // common_thin @ [true, true] |- App(proj_fthin, proj_xthin)
-        // You want to intern in the smallest possible canonical context
-        let thin_to_needed = f.0.bitor(&x.0); // bitwise or
-        assert!(thin_to_needed.0.iter().all(|b| *b));
-        // Wait... But shouldn't it e the case that thin_to_needed is all true?
-        let f1 = Id(f.0.div(&thin_to_needed), f.1);
-        let x1 = Id(x.0.div(&thin_to_needed), x.1);
-        let id = self.add_node(thin_to_needed.cod(), Node::App(f1, x1));
-        id.weaken(&thin_to_needed) // widen the id the common context;
-        */
-
-/*
-            for (thin, rawid) in ids {
-            // Take those that can be raised into id0's context
-            res.extend(
-                id0.0
-                    .all_comm_triangles(&thin)
-                    .into_iter()
-                    .map(|thin1| Id(thin1, rawid)),
-            )
-        }
-     */
-
-    pub fn nodes_in_class_no_find(&self, id: &Id) -> Vec<(Thin, usize)> {
-        // Is it worth making this an Iterator instead of returning Vec?
-        //let Id(thin, rawid) = self.find(id);
-        let mut res = vec![];
-        let ctx = id.ctx();
-        let mut todo = vec![(Thin::id(id.minctx()), id.1)];
-        //let orig_thin = id.0.clone();
-        while let Some((thin, rawid)) = todo.pop() {
-            match &self.nodes[rawid] {
-                Node::UNode(a, b) => {
-                    let thina = a.0.comp(&thin);
-                    //if thina.dom() < ctx {
-                        todo.push((thina, a.1)); // This composition is in the opposite direction of weakening
-                    //}
-                    todo.push((b.0.comp(&thin), b.1));
-                }
-                _ => res.push((thin, rawid)),
-            }
-        }
-        res
-    }
-
-    pub fn nodes_in_class(&self, id: &Id) -> Vec<(Thin, usize)> {
-        self.nodes_in_class_no_find(&self.find(id))
-    }
-
-// type Pattern = (usize, Term); // first n variables are pattern variables.
-
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-struct MinId {
-    ctx: usize,
-    rawid: usize,
-} // An Id that has an implicit Id thinning of size ctx
-// TODO: I should possibly have
-
-
-    /*
-    fn all_comm_squares(&self, other: &Thin) -> Vec<(Thin, Thin)> {
-        // Its not _all_ of them but it is the non tivial ones that form a frontier.
-        // Needed for bottom up ematching
-        assert_eq!(self.cod(), other.cod());
-        let self_ = &self.0;
-        let other = &other.0;
-        let mut todo = vec![(0, vec![], 0, vec![])];
-        let mut res = vec![];
-        while let Some((mut i, mut t1, mut j, mut t2)) = todo.pop() {
-            while (i < self_.len() && self_[i]) || (j <= other.len() && other[j]) {
-                if self_[i] && other[j] {
-                    // Both take pinned value
-                    t1.push(true);
-                    t2.push(true);
-                    i += 1;
-                    j += 1;
-                } else if self_[i] {
-                    // have to take other to get back in sync to true true
-                    // No we can still have true true true happen.
-                    j += 1;
-                    t1.push(false);
-                    t2.push(true);
-                    // No we can also take
-                } else if other[j] {
-                    // have to take self to get back in sync
-                    i += 1;
-                    t1.push(true);
-                    t2.push(false);
-                }
-            }
-            if i == self.0.len() && j == other.len() {
-                let t1 = Thin(t1);
-                let t2 = Thin(t2);
-                assert_eq!(t1.dom(), t2.dom());
-                assert_eq!(t1.cod(), self_.len());
-                assert_eq!(t2.cod(), other.len());
-                res.push((t1, t2))
-            } else {
-                // both false. Need to try both orderings
-                assert!(!self_[i]);
-                assert!(!other[j]);
-                let mut t1a = t1.clone();
-                let mut t2a = t2.clone();
-                t1a.push(true);
-                t2a.push(false);
-                todo.push((i + 1, t1a, j, t2a));
-                t1.push(false);
-                t2.push(true);
-                todo.push((i, t1, j + 1, t2));
-            }
-        }
-        res
-    }
-    */
-
-    /*
-    fn all_comm_triangles(&self, other: &Thin) -> Vec<Thin> {
-        /*
-
-        */
-        assert_eq!(self.cod(), other.cod());
-        assert!(self.dom() >= other.dom());
-        let N = self.dom() - self.cod();
-        let k = other.dom() - other.cod();
-        // all 1010101 strings with extras 1 digits. N choose k
-
-        let res = vec![];
-        let res = vec![(0, vec![])];
-        for b in self.0 {}
-    }
-    */
-
-    /*
-    let obj = zip(self.0.iter(), other.0.iter())
-        .filter(|(a, b)| **a && **b)
-        .count();
-    let proj_self = zip(self.0.iter(), other.0.iter())
-        .filter_map(|(a, b)| if *a { Some(*b) } else { None })
-        .collect();
-    let proj_other = zip(self.0.iter(), other.0.iter())
-        .filter_map(|(a, b)| if *b { Some(*a) } else { None })
-        .collect();
-
-    (obj, Thin(proj_self), Thin(proj_other))
-    */
-
-// UserId = (Vec<String>, usize)
-/*
-struct UserId { maxctx : Vec<String>, needed : thin, rawid : usize}
-*/
-            //let rawz = self.makeset(a.ctx()); // Hmm. Maybe this is wrong. I don't want nodes and uf out of sync. Maybe UNode is appropriate
-            // Actually unodes are essential for enumeration, because the annotations are tree structured.
-            // We actually need to insert carefully into unode tree? no, maybe not.
-            // So the monus heap shows up as the enumerator?
-
-    // TODO remove.
-    pub fn bitor(&self, other: &Thin) -> Thin {
-        //! bitwise or. Useful for computing the needed context of a node from its children.
-        assert_eq!(self.dom(), other.dom());
-        Thin(
-            zip(self.0.iter(), other.0.iter())
-                .map(|(x, y)| *x || *y)
-                .collect(),
-        )
-    }
-
-    fn div(&self, small: &Thin) -> Thin {
-        //! self.comp(output) = small  if small <= self
-        //! self :   ctxn -> ctxm
-        //! small :  ctxn -> ctxk
-        //! output : ctxm -> ctxk
-        assert_eq!(self.dom(), small.dom());
-
-        assert!(
-            self.is_ge(small),
-            "The small thinning should be a sub thinning of the bigger one (self)"
-        ); // small <= self
-        Thin(
-            zip(self.0.iter(), small.0.iter())
-                .filter(|(_, b)| **b)
-                .map(|(a, _)| *a)
-                .collect(),
-        )
-    }
-
-        /*
-        lam x, 5
-        lam(wide([false], lit(5)))
-
-        union(1 |- x * 0, 1 |- wide([false], 0))
-
-        lam x, f(f(f(f(a))))
-        lam(wide([false], f(f(f(f(a))))))
-        lam(drop(x, f(f(f(f(a))))))
-        */
-
-
-    /*fn makeset(&mut self, ctx: usize) -> usize {
-        let rawid = self.uf.len();
-        self.uf.push(Id(Thin::id(ctx), rawid));
-        rawid
-    } */
-
-    /*
-
-    [false, true, true] . [true, false] = [false, true, false]
-
-
-    [true, true, false] @ ([x,y] |- x + y) ===> [x, y, _] |- x + y
-    [true, true, false] @ (2 |- v0 + v1)    ===> 3 |- v0 + v1
-    [true, false , true] @ (2 |- v0 + v1)   ===> 3 |- v0 + v2
-
-    (3 |- a + hole) @ [true, true, false] @ (2 |- v0 + v1)
-
-    All of these are wrong though. They are in half de bruijn
-
-
-    [true, false, true] |-  wide([false,true],v)  + wide([true, false], v) ======  v2 + v0 in the de bruijn sense.
-
-     */
-
-    pub fn lower(&self, thin: &Thin) -> Id {
-        assert!(thin.is_ge(&self.0));
-        Id(thin.div(&self.0), self.1)
-    }
-
-
-{x, y} |- x + y  slotted
-[x, y] |- x + y  thinning
-
-lam {x,y,z}, t(x,y,z)
-lam [x,y,z], t(x,y,z)
-
-sum {x,y,z}, t(x,y,z) slotted
-sum [x,y,z], t(x,y,z)
-
-
-union([x,y] |- f(x,y), [x,y] |- g(x,y))
-union(2, f(v0, v1), g(v0, v1))
-query:
- [x,y] | f(y,x) = [x,y] |- g(y,x) No
-
- [y,x] |- f(y,x) = [y,x] |- g(y,x) Yes
- [x,y] |- f(y,x) = g(y,x)
- 2 |- f(v1, v0) = g(v1, v0)
-
-
- {x,y} |- f(x,y) -->   -keyword argument style -> sorting keyword argument <-> positional
- lam x y z,       positional argument style
-
-global slot ordering but only mappings that monotonic or preserve that ordering --> thinnings
-
-    /// global slot order?
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-
-    pub fn lcm(&self, other: &Thin) -> Thin {
-        //! Reconcile two thinnings with common domain. Basically bitwise and.
-        assert_eq!(self.dom(), other.dom());
-        Thin(
-            zip(self.0.iter(), other.0.iter())
-                .map(|(x, y)| *x && *y)
-                .collect(),
-        )
-    }
-
-
-        /*
-    fn divl(&self, other: &Thin) -> Self {
-        //! self : ctxn ->
-        //! small : ctxn ->
-        //! output :
-        other.div(self)
-        /*
-        Thin(
-            zip(self.0.iter(), other.0.iter())
-                .filter(|(a, b)| **a)
-                .map(|(_, b)| *b)
-                .collect(),
-        )
-        */
-    }
-    */
-*/

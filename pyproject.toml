@@ -4,7 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "kdrag-egraph"
-requires-python = ">=3.8"
+readme = "README.md"
+# Keep interpreter discovery within the versions supported by PyO3 0.27.
+requires-python = ">=3.8,<3.15"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -14,3 +16,6 @@ dynamic = ["version"]
 
 [dependency-groups]
 dev = ["maturin>=1.11.5", "pytest>=8.3.5"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]

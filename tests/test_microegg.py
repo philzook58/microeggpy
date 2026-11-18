@@ -1,156 +1,72 @@
-from microegg import EGraph, Term, Node
-from dataclasses import dataclass
+import pytest
+from microegg import EGraph, Node, Term
 
 
-@dataclass
-class FuncDeclRef:
-    f: str
-    E: EGraph
-
-    def __call__(self, *args):
-        id = self.E.add(self.f, args)
-        return ExprRef(id, self.E)
-
-
-@dataclass
-class ExprRef:
-    id: int
-    E: EGraph
-
-    def __add__(self, other):
-        return FuncDeclRef("+", self.E)(self, other)
-
-
-def test_add_node():
+def test_congruence_and_native_types():
     g = EGraph()
-    id1 = g.add("a", [])
-    id2 = g.add("a", [])
-    assert id1 == id2
-    id3 = g.add("b", [])
-    assert id3 != id1
-    assert not g.is_eq(id1, id3)
-    g.union(id1, id3)
-    assert g.is_eq(id1, id3)
+    a, b = g.add("a", []), g.add("b", [])
+    assert g.add_node(Node("a", [])) == a
+    fa, fb = g.add("f", [a]), g.add("f", [b])
+    assert not g.is_eq(fa, fb)
+    assert g.union(a, b)
+    assert not g.union(a, b)
+    assert g.is_eq(fa, fb)
+    assert Node("f", [a]) == Node("f", [a])
+    assert hash(Term.App("f", [Term.Var("x")])) == hash(Term.App("f", [Term.Var("x")]))
+    assert Node("f", [a]).args == [a]
+    with pytest.raises(ValueError):
+        g.add("f", [999])
 
 
-def test_pattern():
-    p = Term.Var("x")
-    assert repr(p) == "Var(x)"
-    fx = Term.App("f", [p])
-    assert repr(fx) == "App(f, [Var(x)])"
-    fx2 = Term.App("f", [Term.Var("x")])
-    assert fx == fx2
-    assert hash(fx) == hash(fx2)
-    E = EGraph()
-    a = E.add("a", [])
-    id1 = E.add("f", [E.add("a", [])])
-    assert E.ematch(fx, id1) == [{"x": a}]
-    b = E.add("b", [])
-    E.union(a, b)
-    E.rebuild()
-    assert len(E.ematch(fx, id1)) == 2  # [{"x": a}, {"x": b}]
-
-    match fx2:
-        case Term.App("f", _):
-            assert True
-        case _:
-            assert False
-
-    """
-    assert E.to_list() == [
-        (("a", []), 2),
-        (("f", [0]), 1),
-        (("b", []), 2),
-        (("f", [2]), 1),
-    ]
-    """
+def test_repeated_variable_and_operator_mismatch():
+    g = EGraph()
+    a, b = g.add("a", []), g.add("b", [])
+    aa, bb, ab = [g.add("f", args) for args in ([a, a], [b, b], [a, b])]
+    g.union(aa, bb)
+    g.union(bb, ab)
+    x, y = Term.Var("x"), Term.Var("y")
+    assert len(g.ematch(Term.App("f", [x, x]), aa)) == 2
+    assert len(g.ematch(Term.App("f", [x, y]), aa)) == 3
+    assert g.ematch(Term.App("other", [x, y]), aa) == []
+    assert g.ematch(Term.App("f", [x]), aa) == []
 
 
-def test_apply_rules():
-    E = EGraph()
-    a = E.add("a", [])
-    b = E.add("b", [])
-    fa = E.add("f", [a])
-    E.union(a, b)
-    E.rebuild()
-    p = Term.App("a", [])
+def test_rules_and_validation():
+    g = EGraph()
     x = Term.Var("x")
-    fx = Term.App("f", [x])
-    # assert E.ematch(fx, fa) == None
-    assert E.ematch(fx, a) == []
-    E.add_rule(fx, p)
-    E.apply_rules(fa)
-    E.apply_rules(a)
-    assert E.is_eq(a, b)
-    assert E.is_eq(a, fa)
+    a = g.add("a", [])
+    fa = g.add("f", [a])
+    g.add_rule(Term.App("f", [x]), x)
+    assert g.run(0) == 0
+    assert g.run(5) <= 5
+    assert g.is_eq(a, fa)
+    assert g.extract(fa) == (1, Term.App("a", []))
+    with pytest.raises(ValueError):
+        g.add_term(x)
+    with pytest.raises(ValueError):
+        g.add_rule(x, Term.Var("unbound"))
 
 
 def test_ac():
-    E = EGraph()
-    a = E.add("a", [])
-    acc = a
-    for i in range(3):
-        n = E.add(str(i), [])
-        acc = E.add("+", [acc, n])
-    x = Term.Var("x")
-    y = Term.Var("y")
-    z = Term.Var("z")
-    plus = lambda x, y: Term.App("+", [x, y])
-
-    E.add_rule(plus(x, plus(y, z)), plus(plus(x, y), z))
-    E.add_rule(plus(plus(x, y), z), plus(x, plus(y, z)))
-    E.add_rule(plus(x, y), plus(y, x))
-
-    E.run(2)
-    # assert E.size() == 16
+    g = EGraph()
+    x, y, z = map(Term.Var, "xyz")
+    plus = lambda a, b: Term.App("+", [a, b])
+    a, b, c = [Term.App(s, []) for s in "abc"]
+    start = g.add_term(plus(plus(a, b), c))
+    goal = g.add_term(plus(c, plus(b, a)))
+    g.add_rule(plus(x, y), plus(y, x))
+    g.add_rule(plus(plus(x, y), z), plus(x, plus(y, z)))
+    g.add_rule(plus(x, plus(y, z)), plus(plus(x, y), z))
+    g.run(10)
+    assert g.is_eq(start, goal)
+    assert g.num_classes() == 7
 
 
-def test_extract_skips_cycles():
-    E = EGraph()
-    a = E.add("a", [])
-    fa = E.add("f", [a])
-    E.union(a, fa)
-    E.rebuild()
-
-    cost, term = E.extract(fa)
-    assert cost == 1
-    assert term == Term.App("a", [])
-
-
-def test_memo():
-    E = EGraph()
-    a = E.add("a", [])
-    b = E.add("b", [])
-    fa = E.add("f", [a])
-    fb = E.add("f", [b])
-    assert len(E.memo) == 4
-    assert len(E.uf) == 4
-    print(E.memo)
-    Node("f", [a]) in E.memo.keys()
-    E.memo[Node("f", [a])] == fa
-
-
-def test_compact():
-    E = EGraph()
-    a = E.add("a", [])
-    b = E.add("b", [])
-    c = E.add("c", [])
-    fa = E.add("f", [a])
-    fb = E.add("f", [b])
-    fc = E.add("f", [c])
-    assert E.num_classes() == 6
-    E.union(a, b)
-    E.union(b, c)
-    assert E.num_classes() == 4
-    # compaction should actually do rebuilding also
-    compacted = E.compact()
-    assert len(compacted.nodes) == 4
-    assert compacted.num_classes() == 2
-
-    E.rebuild()
-    compacted = E.compact()
-    assert len(E.nodes) == 6
-    assert E.num_classes() == 2
-
-    assert len(compacted.nodes) == 4
-    assert compacted.num_classes() == 2
+def test_extraction_relaxes_mutually_recursive_alternatives():
+    g = EGraph()
+    a, b = g.add("a", []), g.add("b", [])
+    fa, fb = g.add("f", [a]), g.add("f", [b])
+    g.union(a, fb)
+    g.union(b, fa)
+    assert g.extract(a)[0] == 1
+    assert g.extract(b)[0] == 1

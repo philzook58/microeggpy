@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Python 3.8 is unavailable on newer Ubuntu runner images.
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python: ['3.8', '3.14']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: cargo test --locked
+      - run: cargo check --locked --all-targets
+      - run: python -m pip install 'maturin>=1.11,<2' 'pytest>=8.3.5'
+      - run: maturin build --locked --out dist
+      - run: python -m pip install --no-deps dist/*.whl
+      - run: python -m pytest -q
+      - run: python examples/scoped_sum.py
