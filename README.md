@@ -2,6 +2,7 @@
 
 Small e-graphs in the style of [Max Willsey's microegg](https://github.com/mwillsey/microegg).
 Install the Python distribution `kdrag-egraph`; import it as `microegg`.
+Python 3.8 through 3.14 are supported by the current PyO3 version.
 PyO3 exposes the Rust implementations directly, and maturin builds the package.
 
 There are two concrete implementations: ordinary `microegg.EGraph` and
