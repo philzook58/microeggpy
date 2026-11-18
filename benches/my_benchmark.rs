@@ -5,10 +5,10 @@ use std::hint::black_box;
 
 fn ac(n: usize) {
     let mut g = EGraph::default();
-    let mut acc = g.app(&0.to_string(), vec![]);
+    let mut acc = g.add(&0.to_string(), vec![]).unwrap();
     for i in 1..n {
-        let x = g.app(&i.to_string(), vec![]);
-        acc = g.app("add", vec![acc, x]);
+        let x = g.add(&i.to_string(), vec![]).unwrap();
+        acc = g.add("add", vec![acc, x]).unwrap();
     }
     //let rules = vec![
     //    (Term::App("+".into(), vec![Term::Var("x".into()), Term::Var("y".into())]), Term::App("+".into(), vec![Term::Var("x".into()), Term::Var("y".into())]))
@@ -18,7 +18,10 @@ fn ac(n: usize) {
         add(add(?x, ?y),?z) => add(?x, add(?y, ?z)),
         add(?x, add(?y, ?z)) => add(add(?x, ?y),?z),
     ];
-    g.run(&_rules, n);
+    for (lhs, rhs) in _rules {
+        g.add_rule(lhs, rhs).unwrap();
+    }
+    g.run(n);
 }
 
 fn criterion_benchmark(c: &mut Criterion) {

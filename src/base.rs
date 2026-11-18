@@ -1,32 +1,107 @@
-// Largely pulled from: https://github.com/mwillsey/microegg/blob/main/src/lib.rs
-use std::collections::HashMap;
+//! An ordinary microegg-style e-graph. Rust and Python use this same implementation.
+use pyo3::{exceptions::PyValueError, prelude::*};
+use std::collections::{HashMap, HashSet};
+
 pub type Id = usize;
+type Subst = HashMap<String, Id>;
 
-type Name = String;
+#[pyclass(frozen, eq, hash, get_all, module = "microegg")]
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
-pub enum Node {
-    App { f: Name, args: Vec<Id> },
+pub struct Node {
+    pub f: String,
+    pub args: Vec<Id>,
 }
 
-#[derive(Default, Debug)]
-pub struct EGraph {
-    pub memo: HashMap<Node, Id>,
-    pub nodes: Vec<Node>, // todo Indexmap?
-    pub uf: Vec<Id>,
-    pub sibling: Vec<Id>,
+#[pymethods]
+impl Node {
+    #[new]
+    pub fn new(f: String, args: Vec<Id>) -> Self {
+        Self { f, args }
+    }
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
 }
 
+/// `Var` is a pattern metavariable; constants are nullary `App`s.
+#[pyclass(frozen, eq, hash, module = "microegg")]
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum Term {
-    Var(Name),
-    App(Name, Vec<Term>),
-    // EId
+    Var(String),
+    App(String, Vec<Term>),
 }
 
-type Subst = HashMap<Name, Id>;
+#[pymethods]
+impl Term {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+impl Term {
+    fn variables(&self, out: &mut HashSet<String>) {
+        match self {
+            Self::Var(name) => {
+                out.insert(name.clone());
+            }
+            Self::App(_, args) => {
+                for arg in args {
+                    arg.variables(out);
+                }
+            }
+        }
+    }
+}
+
+#[pyclass(module = "microegg")]
+#[derive(Default, Debug)]
+pub struct EGraph {
+    memo: HashMap<Node, Id>,
+    nodes: Vec<Node>,
+    parent: Vec<Id>,
+    sibling: Vec<Id>,
+    rules: Vec<(Term, Term)>,
+}
 
 impl EGraph {
-    pub fn nodes_in_class(&self, class: Id) -> impl Iterator<Item = &Node> {
+    fn check(&self, id: Id) -> PyResult<()> {
+        if id < self.parent.len() {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err("invalid e-class ID"))
+        }
+    }
+    fn root(&self, mut id: Id) -> Id {
+        while self.parent[id] != id {
+            id = self.parent[id];
+        }
+        id
+    }
+    fn merge(&mut self, a: Id, b: Id) -> bool {
+        let (a, b) = (self.root(a), self.root(b));
+        if a == b {
+            return false;
+        }
+        self.parent[a] = b;
+        self.sibling.swap(a, b);
+        true
+    }
+    fn intern(&mut self, node: Node) -> Id {
+        let node = Node {
+            f: node.f,
+            args: node.args.into_iter().map(|id| self.root(id)).collect(),
+        };
+        if let Some(&id) = self.memo.get(&node) {
+            return self.root(id);
+        }
+        let id = self.parent.len();
+        self.parent.push(id);
+        self.sibling.push(id);
+        self.nodes.push(node.clone());
+        self.memo.insert(node, id);
+        id
+    }
+    fn nodes_in_class(&self, class: Id) -> impl Iterator<Item = &Node> {
         let mut id = class;
         let mut first = true;
         std::iter::from_fn(move || {
@@ -34,279 +109,254 @@ impl EGraph {
                 return None;
             }
             first = false;
+            let node = &self.nodes[id];
             id = self.sibling[id];
-            Some(&self.nodes[id])
+            Some(node)
         })
     }
-    pub fn add_term(&mut self, term: &Term, subst: &Subst) -> Id {
-        match term {
-            Term::Var(name) => subst[name],
-            Term::App(f, args) => {
-                let args = args.iter().map(|arg| self.add_term(arg, subst)).collect();
-                self.add_node(Node::App { f: f.into(), args })
-            }
-        }
-    }
-
-    pub fn add_node(&mut self, node: Node) -> Id {
-        let node = self.canonicalize_node(&node);
-        if let Some(&id) = self.memo.get(&node) {
-            id
-        } else {
-            let new_id = self.uf.len();
-            self.uf.push(new_id);
-            self.sibling.push(new_id);
-            self.nodes.push(node.clone());
-            self.memo.insert(node, new_id);
-            new_id
-        }
-    }
-
-    pub fn app(&mut self, f: &str, args: Vec<Id>) -> Id {
-        let node = Node::App {
-            f: f.into(),
-            args: args.into(),
-        };
-        self.add_node(node)
-    }
-
-    pub fn union(&mut self, a: Id, b: Id) {
-        let a = self.find(a);
-        let b = self.find(b);
-        if a != b {
-            self.uf[a] = b;
-            // Splice together the two loops of siblings
-            let a_next = self.sibling[a];
-            let b_next = self.sibling[b];
-            self.sibling[a] = b_next;
-            self.sibling[b] = a_next;
-        }
-    }
-
-    pub fn find(&self, mut a: Id) -> Id {
-        while self.uf[a] != a {
-            a = self.uf[a];
-        }
-        a
-    }
-
-    pub fn is_eq(&self, a: Id, b: Id) -> bool {
-        self.find(a) == self.find(b)
-    }
-
-    pub fn canonicalize_node(&self, node: &Node) -> Node {
-        match node {
-            Node::App { f, args } => Node::App {
-                f: f.clone(),
-                args: args.iter().map(|id| self.find(*id)).collect(),
-            },
-        }
-    }
-
-    pub fn num_classes(&self) -> usize {
-        // Could track as field in EGraph.
-        (0..self.uf.len()).filter(|&id| self.find(id) == id).count()
-    }
-
-    pub fn rebuild(&mut self) {
-        // copy needed for borrowing
-        let nodes_copy = self.memo.clone();
-
-        let mut keep_going = true;
-        while keep_going {
-            keep_going = false;
-            for (node, id) in &nodes_copy {
-                let new_id = self.add_node(node.clone());
-                if !self.is_eq(new_id, *id) {
-                    self.union(new_id, *id);
-                    keep_going = true;
-                }
-            }
-        }
-    }
-
-    pub fn compact(&self) -> Self {
-        let mut egraph = EGraph::default();
-        let mut root_map = HashMap::new();
-        for (id, node) in self.nodes.iter().enumerate() {
-            let new_node = match node {
-                Node::App { f, args } => Node::App {
-                    f: f.clone(),
-                    args: args.iter().map(|id| root_map[&self.find(*id)]).collect(),
-                },
-            };
-            let id2 = egraph.add_node(new_node);
-            let id = self.find(id);
-            if let Some(&existing_id) = root_map.get(&id) {
-                egraph.union(id2, existing_id); // order matters?
-            } else {
-                root_map.insert(id, id2);
-            }
-        }
-        egraph
-    }
-
-    pub fn ematch(&self, pat: &Term, class: Id) -> Vec<Subst> {
-        self.ematch_rec(pat, class, Default::default())
-    }
-    pub fn ematch_rec(&self, pat: &Term, class: Id, mut subst: Subst) -> Vec<Subst> {
+    fn matches(&self, pat: &Term, class: Id, mut subst: Subst) -> Vec<Subst> {
+        let class = self.root(class);
         match pat {
             Term::Var(name) => {
-                if let Some(&id) = subst.get(name) {
-                    if self.is_eq(id, class) {
-                        return vec![subst];
-                    } else {
+                if let Some(&old) = subst.get(name) {
+                    if self.root(old) != class {
                         return vec![];
                     }
                 } else {
                     subst.insert(name.clone(), class);
-                    return vec![subst];
+                }
+                vec![subst]
+            }
+            Term::App(f, args) => self
+                .nodes_in_class(class)
+                .filter(|node| node.f == *f && node.args.len() == args.len())
+                .flat_map(|node| {
+                    args.iter()
+                        .zip(&node.args)
+                        .fold(vec![subst.clone()], |todo, (p, &a)| {
+                            todo.into_iter()
+                                .flat_map(|s| self.matches(p, a, s))
+                                .collect()
+                        })
+                })
+                .collect(),
+        }
+    }
+    fn instantiate(&mut self, term: &Term, subst: &Subst) -> Id {
+        match term {
+            Term::Var(name) => self.root(subst[name]),
+            Term::App(f, args) => {
+                let args = args.iter().map(|a| self.instantiate(a, subst)).collect();
+                self.intern(Node::new(f.clone(), args))
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl EGraph {
+    #[new]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_node(&mut self, node: Node) -> PyResult<Id> {
+        for &arg in &node.args {
+            self.check(arg)?;
+        }
+        Ok(self.intern(node))
+    }
+    pub fn add(&mut self, f: &str, args: Vec<Id>) -> PyResult<Id> {
+        self.add_node(Node::new(f.into(), args))
+    }
+    pub fn add_term(&mut self, term: &Term) -> PyResult<Id> {
+        let mut vars = HashSet::new();
+        term.variables(&mut vars);
+        if !vars.is_empty() {
+            return Err(PyValueError::new_err(
+                "concrete terms cannot contain metavariables",
+            ));
+        }
+        Ok(self.instantiate(term, &Subst::new()))
+    }
+    pub fn find(&self, id: Id) -> PyResult<Id> {
+        self.check(id)?;
+        Ok(self.root(id))
+    }
+    pub fn union(&mut self, a: Id, b: Id) -> PyResult<bool> {
+        self.check(a)?;
+        self.check(b)?;
+        Ok(self.merge(a, b))
+    }
+    pub fn is_eq(&mut self, a: Id, b: Id) -> PyResult<bool> {
+        self.check(a)?;
+        self.check(b)?;
+        self.rebuild();
+        Ok(self.root(a) == self.root(b))
+    }
+    pub fn rebuild(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let mut merged = false;
+            // Re-key existing classes instead of allocating new IDs. Allocating
+            // here can chase fresh representatives forever on cyclic graphs.
+            for (node, id) in std::mem::take(&mut self.memo) {
+                let canonical = Node::new(
+                    node.f.clone(),
+                    node.args.iter().map(|&a| self.root(a)).collect(),
+                );
+                changed |= canonical != node;
+                let id = self.root(id);
+                if let Some(&other) = self.memo.get(&canonical) {
+                    merged |= self.merge(id, other);
+                } else {
+                    self.memo.insert(canonical, id);
                 }
             }
-            Term::App(pf, pargs) => {
-                let mut results = vec![];
-                for node in self.nodes_in_class(class) {
-                    match node {
-                        Node::App { f, args } => {
-                            if f == pf && pargs.len() == args.len() {
-                                let mut todo = vec![subst.clone()];
-                                for (pa, na) in pargs.iter().zip(args.iter()) {
-                                    todo = todo
-                                        .into_iter()
-                                        .flat_map(|subst| self.ematch_rec(pa, *na, subst))
-                                        .collect();
-                                }
-
-                                results.extend(todo);
-                            }
+            changed |= merged;
+            if !merged {
+                return changed;
+            }
+        }
+    }
+    pub fn ematch(&mut self, pattern: &Term, class: Id) -> PyResult<Vec<Subst>> {
+        self.check(class)?;
+        self.rebuild();
+        Ok(self.matches(pattern, class, Subst::new()))
+    }
+    pub fn add_rule(&mut self, lhs: Term, rhs: Term) -> PyResult<()> {
+        let (mut left, mut right) = (HashSet::new(), HashSet::new());
+        lhs.variables(&mut left);
+        rhs.variables(&mut right);
+        if !right.is_subset(&left) {
+            return Err(PyValueError::new_err("RHS uses an unbound metavariable"));
+        }
+        self.rules.push((lhs, rhs));
+        Ok(())
+    }
+    /// Run at most `limit` search-then-apply rounds, stopping at a fixed point.
+    pub fn run(&mut self, limit: usize) -> usize {
+        self.rebuild();
+        for round in 0..limit {
+            let mut matches = vec![];
+            for (lhs, rhs) in &self.rules {
+                for class in 0..self.parent.len() {
+                    if self.root(class) == class {
+                        for subst in self.matches(lhs, class, Subst::new()) {
+                            matches.push((class, rhs.clone(), subst));
                         }
                     }
                 }
-                results
+            }
+            let mut changed = false;
+            for (class, rhs, subst) in matches {
+                let replacement = self.instantiate(&rhs, &subst);
+                changed |= self.merge(class, replacement);
+            }
+            changed |= self.rebuild();
+            if !changed {
+                return round + 1;
             }
         }
+        limit
+    }
+    pub fn num_classes(&self) -> usize {
+        (0..self.parent.len())
+            .filter(|&id| self.root(id) == id)
+            .count()
+    }
+    pub fn node_count(&self) -> usize {
+        self.memo.len()
     }
 
-    pub fn apply_rules(&mut self, eclass: Id, rules: &[(Term, Term)]) {
-        // Copy rules so we can mutate the e-graph while iterating matches.
-        for (lhs, rhs) in rules {
-            let matches = self.ematch(lhs, eclass);
-            for subst in matches {
-                let new_id = self.add_term(rhs, &subst);
-                self.union(eclass, new_id);
+    /// Least node-count finite representative. Relaxation handles cyclic classes.
+    pub fn extract(&mut self, class: Id) -> PyResult<(usize, Term)> {
+        self.check(class)?;
+        self.rebuild();
+        let mut best: HashMap<Id, (usize, Term)> = HashMap::new();
+        loop {
+            let mut changed = false;
+            for (id, node) in self.nodes.iter().enumerate() {
+                let children: Option<Vec<_>> = node
+                    .args
+                    .iter()
+                    .map(|&id| best.get(&self.root(id)).cloned())
+                    .collect();
+                let Some(children) = children else {
+                    continue;
+                };
+                let cost = children
+                    .iter()
+                    .fold(1usize, |n, (c, _)| n.saturating_add(*c));
+                let root = self.root(id);
+                if best.get(&root).is_none_or(|(old, _)| cost < *old) {
+                    best.insert(
+                        root,
+                        (
+                            cost,
+                            Term::App(
+                                node.f.clone(),
+                                children.into_iter().map(|(_, t)| t).collect(),
+                            ),
+                        ),
+                    );
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
-    }
-
-    pub fn run(&mut self, rules: &[(Term, Term)], n: usize) {
-        for _i in 0..n {
-            for eclass in 0..self.uf.len() {
-                self.apply_rules(eclass, rules);
-            }
-            self.rebuild();
-        }
-    }
-
-    pub fn extract(&self, class: Id) -> (usize, Term) {
-        fn worker(
-            egraph: &EGraph,
-            cost: &mut HashMap<Id, Option<(usize, Term)>>,
-            class: Id,
-        ) -> Option<(usize, Term)> {
-            let class = egraph.find(class);
-            if let Some(best) = cost.get(&class) {
-                return best.clone();
-            }
-
-            cost.insert(class, None);
-
-            let best = egraph
-                .nodes_in_class(class)
-                .filter_map(|node| match node {
-                    Node::App { f, args } => {
-                        let arg_costs: Option<Vec<_>> =
-                            args.iter().map(|&arg| worker(egraph, cost, arg)).collect();
-                        let arg_costs = arg_costs?;
-                        let total_cost = 1 + arg_costs
-                            .iter()
-                            .map(|(node_cost, _)| *node_cost)
-                            .sum::<usize>();
-                        let args = arg_costs.into_iter().map(|(_, term)| term).collect();
-                        Some((total_cost, Term::App(f.clone(), args)))
-                    }
-                })
-                .min_by_key(|(node_cost, _)| *node_cost);
-
-            cost.insert(class, best.clone());
-            best
-        }
-
-        let mut cost: HashMap<Id, Option<(usize, Term)>> = HashMap::new();
-        worker(self, &mut cost, class)
-            .unwrap_or_else(|| panic!("could not extract an acyclic term from class {}", class))
+        best.remove(&self.root(class))
+            .ok_or_else(|| PyValueError::new_err("class has no finite representative"))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{rw, rws, term};
 
-    use super::*;
     #[test]
-    fn test_base_egraph() {
-        let mut g = EGraph::default();
-        g.add_term(&Term::App("a".into(), vec![]), &HashMap::new());
-        let a = g.app("a", vec![]);
-        let b = g.app("b", vec![]);
-        g.union(a, b);
-        assert_eq!(g.find(a), g.find(b));
+    fn congruence_and_cycles() {
+        let mut g = EGraph::new();
+        let a = g.add("a", vec![]).unwrap();
+        let b = g.add("b", vec![]).unwrap();
+        let fa = g.add("f", vec![a]).unwrap();
+        let fb = g.add("f", vec![b]).unwrap();
+        g.union(a, b).unwrap();
+        assert!(g.is_eq(fa, fb).unwrap());
+        g.union(fa, a).unwrap();
+        assert_eq!(g.extract(fa).unwrap().0, 1);
     }
     #[test]
-    fn test_extract() {
-        let mut g = EGraph::default();
-        let a = g.app("a", vec![]);
-        let fa = g.app("f", vec![a]);
-        g.union(fa, a);
-        assert_eq!(g.extract(fa), (1, Term::App("a".into(), vec![])));
-    }
-
-    #[test]
-    fn test_term_macro_vars() {
-        assert_eq!(
-            term!(f(?x, a, g(?y))),
-            Term::App(
-                "f".into(),
-                vec![
-                    Term::Var("x".into()),
-                    Term::App("a".into(), vec![]),
-                    Term::App("g".into(), vec![Term::Var("y".into())]),
-                ],
-            )
-        );
+    fn mutually_recursive_classes_do_not_allocate_during_rebuild() {
+        let mut g = EGraph::new();
+        let a = g.add("a", vec![]).unwrap();
+        let b = g.add("b", vec![]).unwrap();
+        let fa = g.add("f", vec![a]).unwrap();
+        let fb = g.add("f", vec![b]).unwrap();
+        g.union(a, fb).unwrap();
+        g.union(b, fa).unwrap();
+        let allocated = g.parent.len();
+        g.rebuild();
+        assert_eq!(g.parent.len(), allocated);
+        assert!(!g.rebuild());
+        assert_eq!(g.extract(a).unwrap().0, 1);
+        assert_eq!(g.extract(b).unwrap().0, 1);
     }
 
     #[test]
-    fn test_rw_macro() {
-        assert_eq!(
-            rw!(f(?x) => g(?x)),
-            (
-                Term::App("f".into(), vec![Term::Var("x".into())]),
-                Term::App("g".into(), vec![Term::Var("x".into())]),
-            )
-        );
-    }
-
-    #[test]
-    fn test_rws_macro() {
-        assert_eq!(
-            rws![f(?x) => g(?x), a => b],
-            vec![
-                (
-                    Term::App("f".into(), vec![Term::Var("x".into())]),
-                    Term::App("g".into(), vec![Term::Var("x".into())]),
-                ),
-                (Term::App("a".into(), vec![]), Term::App("b".into(), vec![]),),
-            ]
-        );
+    fn macros_and_rewriting() {
+        assert_eq!(rw!(f(?x) => g(?x)), (term!(f(?x)), term!(g(?x))));
+        let mut g = EGraph::new();
+        let input = g.add_term(&term!(f(a))).unwrap();
+        let rules = rws![f(?x) => g(?x)];
+        for (lhs, rhs) in rules {
+            g.add_rule(lhs, rhs).unwrap();
+        }
+        g.run(3);
+        let goal = g.add_term(&term!(g(a))).unwrap();
+        assert!(g.is_eq(input, goal).unwrap());
     }
 }
