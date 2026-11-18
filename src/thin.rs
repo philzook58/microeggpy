@@ -1,5 +1,23 @@
 //! A lifting e-graph: IDs place a shared class into an ordered variable context.
 //! Core algorithms adapted from philzook58/lambda-microegg, without substitution.
+//!
+//! Liftings are annotations on the edges of the union-find, akin to group
+//! elements like offsets. Each ID represents a function taking ordered arguments;
+//! lifting adds redundant arguments:
+//!
+//! ```text
+//! fun x y => x + y  -----lift_101----->  fun x y z => x + z
+//! ```
+//!
+//! These functions are NOT equal, but are clearly highly related. The lifting
+//! e-graph deduplicates interning memory for different lifts of the same base
+//! function. Liftings have identity and composition. They form a category
+//! (uh oh! I said the C word!).
+//!
+//! Philip's original explanations:
+//! - <https://www.philipzucker.com/thin1/>
+//! - <https://www.philipzucker.com/lambda_miller_egg/>
+//! - <https://github.com/philzook58/lambda-microegg>
 mod extract;
 
 use indexmap::IndexMap;
@@ -7,6 +25,11 @@ use pyo3::{exceptions::PyValueError, prelude::*};
 use std::collections::{HashMap, HashSet};
 
 /// An order-preserving injection. Bits run outermost to innermost; true selects a variable.
+/// Equivalently, a bitvector selects a smaller context from a larger one:
+/// `[x, y, z]` with `[true, false, true]` selects `[x, z]`.
+/// As a lifting, the same bits embed a function of `[x, z]` into `[x, y, z]`,
+/// leaving `y` unused. Here `dom()` counts selected variables and `cod()` is
+/// the ambient context length: the injection direction used in lambda-microegg.
 #[pyclass(frozen, eq, hash, get_all, module = "microegg.thin")]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Thin {
@@ -45,6 +68,8 @@ impl Thin {
         self.bits.len()
     }
     /// `outer.compose(inner)` places the inner context through the outer injection.
+    /// If `outer : A -> Γ` and `inner : B -> A`, the result is `B -> Γ`.
+    /// The inner mask selects among the variables already selected by outer.
     pub fn compose(&self, inner: &Self) -> PyResult<Self> {
         if self.dom() != inner.cod() {
             return Err(PyValueError::new_err(
@@ -69,11 +94,16 @@ impl Thin {
                 .collect(),
         )
     }
+    // Extend the ambient context by its newest variable. Under a binder,
+    // append(true) carries that bound variable along with the outer context.
     fn append(&self, keep: bool) -> Self {
         let mut bits = self.bits.clone();
         bits.push(keep);
         Self::new(bits)
     }
+    /// Factor `target` through this thinning. If `self : A -> Γ` and
+    /// `target : B -> Γ`, return the unique ordered thinning `B -> A`.
+    /// `self.comp(result) == target`; fail if target uses a variable absent in self.
     fn factor(&self, target: &Self) -> Option<Self> {
         if self.cod() != target.cod() {
             return None;
@@ -89,6 +119,10 @@ impl Thin {
         }
         Some(Self::new(bits))
     }
+    /// Form the union of two subcontexts of one shared ambient context.
+    /// This is their coproduct in the subcontext lattice. Application needs
+    /// precisely this union of the function's and argument's dependencies.
+    /// Factor each input through the result to place its child in that context.
     fn join(&self, other: &Self) -> Self {
         debug_assert_eq!(self.cod(), other.cod());
         Self::new(
@@ -99,6 +133,11 @@ impl Thin {
                 .collect(),
         )
     }
+    /// Pull back two thinnings into a shared ambient context: intersect their
+    /// dependency subcontexts, and return the maps from that intersection into
+    /// each input context. For `(common, left, right)`:
+    /// `self.comp(left) == common` and `other.comp(right) == common`.
+    /// Equality can retain only dependencies available on both sides.
     fn meet(&self, other: &Self) -> (Self, Self, Self) {
         debug_assert_eq!(self.cod(), other.cod());
         let common = Self::new(
@@ -112,6 +151,9 @@ impl Thin {
         let right = other.factor(&common).unwrap();
         (common, left, right)
     }
+    /// Largest subcontext of their shared domain on which the two thinnings
+    /// agree, context variable by context variable. Compare the selected
+    /// positions in order, rather than intersecting their ambient bitmasks.
     fn equalizer(&self, other: &Self) -> Self {
         let positions = |t: &Self| {
             t.bits
@@ -131,6 +173,8 @@ impl Thin {
 }
 
 /// A graph-local raw class and its placement in an ambient context.
+/// This fat ID allows lifting an object into a weaker context without having
+/// to reintern it. Its thinning embeds the raw class's own context into `ctx`.
 #[pyclass(frozen, eq, hash, get_all, module = "microegg.thin")]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Id {
@@ -144,6 +188,8 @@ impl Id {
     pub fn ctx(&self) -> usize {
         self.thinning.cod()
     }
+    /// Widen an ID into a larger context with unused variables. Only its
+    /// placement changes; the interned raw class stays the same.
     pub fn weaken(&self, by: &Thin) -> PyResult<Self> {
         if by.dom() != self.ctx() {
             return Err(PyValueError::new_err("weakening context mismatch"));
@@ -179,6 +225,10 @@ impl Id {
 
 // One syntax type serves concrete terms and patterns. Boxing stays inside Rust;
 // only the small constructors below adapt recursive children for PyO3.
+// A de Bruijn index counts outward from the nearest binder; a level names a
+// variable coming down from the ambient context. These are for conventional
+// user syntax, beside the main point of thinning/lifting inside the e-graph.
+// Working with raw thinnings is too mind boggling.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Kind {
     Atom(String),
@@ -310,7 +360,9 @@ enum Node {
 }
 type Subst = HashMap<String, Id>;
 
-/// Every W for which W.compose(edge) == target, including redundant placements.
+/// Find every W for which W.compose(edge) == target. A redundant edge may
+/// admit several W, corresponding to different variables in the target.
+/// E-matching needs all these placements when traversing redundant edges.
 fn factors(target: &Thin, edge: &Thin) -> Vec<Thin> {
     fn visit(
         target: &Thin,
@@ -399,6 +451,9 @@ impl EGraph {
         self.intern(0, Node::Atom(name.into()))
             .lift(&Thin::unused(ctx))
     }
+    /// Return the pulled e-node and the thinning back to its original context.
+    /// Intern only the dependencies used by its children; the returned
+    /// placement restores unused variables in the caller's ambient context.
     fn canonicalize(&self, node: &Node) -> (Thin, Node) {
         match node {
             Node::Var => (Thin::identity(1), Node::Var),
@@ -433,6 +488,10 @@ impl EGraph {
             return false;
         }
         if a.raw == b.raw {
+            // Equating two placements of one class restricts that class to
+            // the context variables on which the placements agree. For example,
+            // f(x) = f(y) turns the result of f into a context-independent
+            // value rather than treating x and y themselves as equal.
             let dependency = a.thinning.equalizer(&b.thinning);
             let root = self.make_set(dependency.dom());
             self.parent[a.raw] = Id::new(root.raw, dependency);
@@ -463,6 +522,12 @@ impl EGraph {
             })
             .collect()
     }
+    // `top` is the ambient context at the top of the pattern; `ctx` additionally
+    // includes variables introduced locally by its binders. A pattern variable
+    // must be carried up to the top context to be carried over to the RHS.
+    // Miller parameters say which local binders it is allowed to depend on;
+    // the whole top context is retained implicitly.
+    // https://www.philipzucker.com/ho_unify/
     fn occurrence(top: usize, ctx: usize, args: &[usize]) -> Thin {
         let mut bits = vec![false; ctx];
         bits[..top].fill(true);
