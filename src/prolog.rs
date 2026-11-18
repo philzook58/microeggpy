@@ -1,3 +1,6 @@
+// https://www.philipzucker.com/ground_lambda_prolog/
+// https://www.philipzucker.com/knuck_prolog/
+
 type Id = usize;
 use indexmap::IndexSet;
 use std::collections::HashMap;
@@ -16,13 +19,17 @@ enum Node {
 struct Branch {
     subst: HashMap<String, Id>,
     goals: Vec<Id>,
-    hyps: Vec<Node>,
+    hyps: Vec<Node>, // local_facts / hyps / ctx
+                     // linear_facts
+                     // uf
+                     // constrs
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct State {
     tb: IndexSet<Node>,
-    branches: Vec<Branch>,
+    branches: Vec<Branch>, // maybe a tree
+                           //global_rules :
 }
 
 impl State {
@@ -50,9 +57,11 @@ impl State {
                         branch1.goals.push(b);
                         branch.goals.push(a);
                     }
-                    _ => {}
+                    _ => {} // todo
                 }
             }
         }
     }
 }
+
+// Also that Horn sat stuff could be cool.
