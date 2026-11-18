@@ -8,13 +8,6 @@ edition = "2024"
 name = "microegg"
 crate-type = ["cdylib", "rlib"]
 
-[dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
-
-[[bench]]
-name = "my_benchmark"
-harness = false
-
 [dependencies]
 indexmap = "2.14.0"
 pyo3 = "0.27.0"

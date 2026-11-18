@@ -1,23 +1,7 @@
 //! A lifting e-graph: IDs place a shared class into an ordered variable context.
 //! Core algorithms adapted from philzook58/lambda-microegg, without substitution.
 //!
-//! Liftings are annotations on the edges of the union-find, akin to group
-//! elements like offsets. Each ID represents a function taking ordered arguments;
-//! lifting adds redundant arguments:
-//!
-//! ```text
-//! fun x y => x + y  -----lift_101----->  fun x y z => x + z
-//! ```
-//!
-//! These functions are NOT equal, but are clearly highly related. The lifting
-//! e-graph deduplicates interning memory for different lifts of the same base
-//! function. Liftings have identity and composition. They form a category
-//! (uh oh! I said the C word!).
-//!
-//! Philip's original explanations:
-//! - <https://www.philipzucker.com/thin1/>
-//! - <https://www.philipzucker.com/lambda_miller_egg/>
-//! - <https://github.com/philzook58/lambda-microegg>
+//! See NOTES.md for the original lifting commentary and blog references.
 mod extract;
 
 use indexmap::IndexMap;
@@ -224,9 +208,7 @@ impl Id {
 // One syntax type serves concrete terms and patterns. Boxing stays inside Rust;
 // only the small constructors below adapt recursive children for PyO3.
 // A de Bruijn index counts outward from the nearest binder; a level names a
-// variable coming down from the ambient context. These are for conventional
-// user syntax, beside the main point of thinning/lifting inside the e-graph.
-// Working with raw thinnings is too mind boggling.
+// variable coming down from the ambient context.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Kind {
     Atom(String),
