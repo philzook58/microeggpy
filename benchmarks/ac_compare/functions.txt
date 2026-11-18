@@ -1,0 +1,77 @@
+atoms AC7 — baseline: 1,451,145,054 instructions (Callgrind Ir)
+Self costs; aggregate recursive/inlined contexts by function.
+root                          342,968,332  23.63%
+other / standard library      338,534,607  23.33%
+thinning composition          283,186,625  19.51%
+allocator (libc)              266,696,482  18.38%
+matches                        44,802,728   3.09%
+nodes_in_class                 36,244,134   2.50%
+instantiate                    22,563,354   1.55%
+rebuild                        20,428,267   1.41%
+Kind::clone                    19,124,684   1.32%
+canonicalize                   17,013,488   1.17%
+
+atoms AC7 — fixed: 694,613,908 instructions (Callgrind Ir)
+Self costs; aggregate recursive/inlined contexts by function.
+other / standard library      313,111,461  45.08%
+allocator (libc)              100,650,959  14.49%
+root                           46,418,568   6.68%
+matches                        44,834,936   6.45%
+nodes_in_class                 36,244,134   5.22%
+root_mut                       29,121,250   4.19%
+instantiate                    22,579,678   3.25%
+thinning composition           19,436,950   2.80%
+canonicalize                   17,013,488   2.45%
+intern                         14,174,322   2.04%
+
+atoms AC7 — lambda: 275,244,800 instructions (Callgrind Ir)
+Self costs; aggregate recursive/inlined contexts by function.
+other / standard library       69,570,197  25.28%
+ematch_rec                     38,848,700  14.11%
+thinning composition           37,289,044  13.55%
+find_mut                       27,881,263  10.13%
+try_instantiate_metavars_rec     23,703,653   8.61%
+nodes_in_class                 22,351,875   8.12%
+canonical_node                 13,017,568   4.73%
+app                            10,830,096   3.93%
+intern                          9,331,902   3.39%
+allocator (libc)                8,210,632   2.98%
+
+variables AC8 — baseline: 1,964,031,639 instructions (Callgrind Ir)
+Self costs; aggregate recursive/inlined contexts by function.
+thinning composition          794,808,029  40.47%
+allocator (libc)              545,955,139  27.80%
+other / standard library      273,652,730  13.93%
+root                          212,143,364  10.80%
+canonicalize                   25,181,216   1.28%
+matches                        23,498,166   1.20%
+run                            18,189,429   0.93%
+rebuild                        17,223,958   0.88%
+nodes_in_class                 12,016,290   0.61%
+instantiate                     9,407,605   0.48%
+
+variables AC8 — fixed: 482,099,839 instructions (Callgrind Ir)
+Self costs; aggregate recursive/inlined contexts by function.
+other / standard library      187,421,261  38.88%
+allocator (libc)              129,094,187  26.78%
+thinning composition           33,086,503   6.86%
+canonicalize                   25,181,216   5.22%
+matches                        23,511,663   4.88%
+root                           21,679,172   4.50%
+nodes_in_class                 12,016,290   2.49%
+root_mut                       10,309,738   2.14%
+instantiate                     9,407,605   1.95%
+application                     8,114,470   1.68%
+
+variables AC8 — lambda: 172,235,293 instructions (Callgrind Ir)
+Self costs; aggregate recursive/inlined contexts by function.
+other / standard library       66,614,247  38.68%
+thinning composition           37,719,997  21.90%
+ematch_rec                     23,187,247  13.46%
+try_instantiate_metavars_rec      9,631,484   5.59%
+find_mut                        9,214,227   5.35%
+nodes_in_class                  7,429,004   4.31%
+canonical_node                  4,585,023   2.66%
+app                             4,435,920   2.58%
+intern                          3,749,063   2.18%
+allocator (libc)                1,934,365   1.12%

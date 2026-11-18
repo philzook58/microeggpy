@@ -329,3 +329,19 @@ def test_extraction_distinguishes_leading_and_trailing_slots():
     lam = g.binder("lam", x_only)
     with pytest.raises(ValueError, match="finite"):
         g.extract(lam)
+
+
+def test_construction_preserves_placements_through_dependent_merges():
+    g = thin.EGraph()
+    first = g.add(apps("f", F(0), F(1), F(2)), 3)
+    middle = g.add(apps("g", F(1), F(2)), 3)
+    last = g.add(apps("h", F(2)), 3)
+    g.union(first, middle)
+    g.union(middle, last)
+    before = g.find(first)
+    assert before.thinning.bits == [False, False, True]
+    lifted = first.weaken(thin.Thin([False, True, False, True, True]))
+    wrapped = g.app(g.atom("wrap", 5), lifted)
+    assert g.find(first) == before
+    expected = g.add(apps("wrap", apps("h", F(4))), 5)
+    assert g.is_eq(wrapped, expected)

@@ -435,9 +435,24 @@ impl EGraph {
         }
         out
     }
+    // Shorten union-find paths while composing their context annotations.
+    // Read-only matching uses root(); construction keeps its paths short here.
+    fn root_mut(&mut self, id: &Id) -> Id {
+        let mut raw = id.raw;
+        loop {
+            let parent = self.parent[raw].raw;
+            if self.parent[parent].raw == parent {
+                break;
+            }
+            let edge = self.parent[raw].clone();
+            self.parent[raw] = self.parent[parent].lift(&edge.thinning);
+            raw = parent;
+        }
+        self.root(id)
+    }
     fn intern(&mut self, ctx: usize, node: Node) -> Id {
         if let Some(&raw) = self.memo.get(&node) {
-            return self.root(&self.origin(raw));
+            return self.root_mut(&self.origin(raw));
         }
         let id = self.make_set(ctx);
         self.memo.insert(node, id.raw);
@@ -454,19 +469,19 @@ impl EGraph {
     /// Return the pulled e-node and the thinning back to its original context.
     /// Intern only the dependencies used by its children; the returned
     /// placement restores unused variables in the caller's ambient context.
-    fn canonicalize(&self, node: &Node) -> (Thin, Node) {
+    fn canonicalize(&mut self, node: &Node) -> (Thin, Node) {
         match node {
             Node::Var => (Thin::identity(1), Node::Var),
             Node::Atom(name) => (Thin::identity(0), Node::Atom(name.clone())),
             Node::App(f, x) => {
-                let (f, x) = (self.root(f), self.root(x));
+                let (f, x) = (self.root_mut(f), self.root_mut(x));
                 let common = f.thinning.join(&x.thinning);
                 let f = Id::new(f.raw, common.factor(&f.thinning).unwrap());
                 let x = Id::new(x.raw, common.factor(&x.thinning).unwrap());
                 (common, Node::App(f, x))
             }
             Node::Binder(op, body) => {
-                let body = self.root(body);
+                let body = self.root_mut(body);
                 let outer = Thin::new(body.thinning.bits[..body.ctx() - 1].to_vec());
                 let inner = Thin::identity(outer.dom()).append(*body.thinning.bits.last().unwrap());
                 (outer, Node::Binder(op.clone(), Id::new(body.raw, inner)))
@@ -483,7 +498,7 @@ impl EGraph {
     }
     fn merge(&mut self, a: &Id, b: &Id) -> bool {
         debug_assert_eq!(a.ctx(), b.ctx());
-        let (a, b) = (self.root(a), self.root(b));
+        let (a, b) = (self.root_mut(a), self.root_mut(b));
         if a == b {
             return false;
         }
@@ -720,6 +735,8 @@ impl EGraph {
         Ok(())
     }
     pub fn run(&mut self, limit: usize) -> usize {
+        // Borrow each RHS from one rule snapshot instead of cloning it per match.
+        let rules = self.rules.clone();
         self.rebuild();
         for round in 0..limit {
             let mut targets = HashSet::new();
@@ -729,18 +746,18 @@ impl EGraph {
             let mut targets: Vec<_> = targets.into_iter().collect();
             targets.sort_by(|a, b| (a.raw, &a.thinning.bits).cmp(&(b.raw, &b.thinning.bits)));
             let mut matches = vec![];
-            for (lhs, rhs) in &self.rules {
+            for (lhs, rhs) in &rules {
                 for target in &targets {
                     if lhs.required_context().max(rhs.required_context()) <= target.ctx() {
                         for subst in self.matches(lhs, target, Subst::new(), target.ctx()) {
-                            matches.push((target.clone(), rhs.clone(), subst));
+                            matches.push((target.clone(), rhs, subst));
                         }
                     }
                 }
             }
             let mut changed = false;
             for (target, rhs, subst) in matches {
-                let replacement = self.instantiate(&rhs, target.ctx(), target.ctx(), &subst);
+                let replacement = self.instantiate(rhs, target.ctx(), target.ctx(), &subst);
                 changed |= self.merge(&target, &replacement);
             }
             changed |= self.rebuild();
@@ -827,6 +844,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn construction_handles_long_union_paths_without_recursion() {
+        let mut g = EGraph::new();
+        let first = g.atom("first", 0);
+        let mut last = first.clone();
+        for i in 0..10_000 {
+            let next = g.atom(&format!("a{i}"), 0);
+            g.union(&last, &next).unwrap();
+            last = next;
+        }
+        let f = g.atom("f", 0);
+        let old = g.app(&f, &first).unwrap();
+        let canonical = g.app(&f, &last).unwrap();
+        assert_eq!(old, canonical);
     }
 
     #[test]
