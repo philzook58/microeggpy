@@ -91,6 +91,9 @@ struct Alignment {
 
 // All common ordered contexts for two representatives. Extra variables can
 // coincide, including with a semantic variable belonging to the other child.
+// For example, [Some(0), None] and [None, Some(1)] can share context
+// [Some(0), Some(1)]: each child's extra variable uses the other's dependency.
+// Keeping only the cheapest witness per class would lose these scope choices.
 fn align(left: &[Option<usize>], right: &[Option<usize>]) -> Vec<Alignment> {
     fn visit(
         a: &[Option<usize>],

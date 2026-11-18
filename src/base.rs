@@ -236,21 +236,22 @@ impl EGraph {
     }
     /// Run at most `limit` search-then-apply rounds, stopping at a fixed point.
     pub fn run(&mut self, limit: usize) -> usize {
+        let rules = self.rules.clone();
         self.rebuild();
         for round in 0..limit {
             let mut matches = vec![];
-            for (lhs, rhs) in &self.rules {
+            for (lhs, rhs) in &rules {
                 for class in 0..self.parent.len() {
                     if self.root(class) == class {
                         for subst in self.matches(lhs, class, Subst::new()) {
-                            matches.push((class, rhs.clone(), subst));
+                            matches.push((class, rhs, subst));
                         }
                     }
                 }
             }
             let mut changed = false;
             for (class, rhs, subst) in matches {
-                let replacement = self.instantiate(&rhs, &subst);
+                let replacement = self.instantiate(rhs, &subst);
                 changed |= self.merge(class, replacement);
             }
             changed |= self.rebuild();

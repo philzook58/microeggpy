@@ -21,7 +21,7 @@ def test_namespace_and_recursive_constructors():
     term = bind("lam", app(A("f"), B(0)))
     assert term == bind("lam", app(A("f"), B(0)))
     assert hash(term) == hash(bind("lam", app(A("f"), B(0))))
-    assert "binder" in repr(term)
+    assert "Binder" in repr(term)
     g = thin.EGraph()
     result = g.add(term)
     assert g.extract(result) == (4, term)

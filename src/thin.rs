@@ -155,18 +155,16 @@ impl Thin {
     /// agree, context variable by context variable. Compare the selected
     /// positions in order, rather than intersecting their ambient bitmasks.
     fn equalizer(&self, other: &Self) -> Self {
-        let positions = |t: &Self| {
+        fn positions(t: &Thin) -> impl Iterator<Item = usize> + '_ {
             t.bits
                 .iter()
                 .enumerate()
-                .filter_map(|(i, &b)| b.then_some(i))
-                .collect::<Vec<_>>()
-        };
+                .filter_map(|(i, &keep)| keep.then_some(i))
+        }
         Self::new(
             positions(self)
-                .iter()
                 .zip(positions(other))
-                .map(|(&a, b)| a == b)
+                .map(|(a, b)| a == b)
                 .collect(),
         )
     }
@@ -285,14 +283,7 @@ impl Term {
         }
     }
     fn __repr__(&self) -> String {
-        match &self.kind {
-            Kind::Atom(s) => format!("atom({s:?})"),
-            Kind::FVar(i) => format!("fvar({i})"),
-            Kind::BVar(i) => format!("bvar({i})"),
-            Kind::App(f, x) => format!("app({}, {})", f.__repr__(), x.__repr__()),
-            Kind::Binder(op, body) => format!("binder({op:?}, {})", body.__repr__()),
-            Kind::Meta(s, args) => format!("meta({s:?}, {args:?})"),
-        }
+        format!("{:?}", self.kind)
     }
 }
 
@@ -362,6 +353,9 @@ type Subst = HashMap<String, Id>;
 
 /// Find every W for which W.compose(edge) == target. A redundant edge may
 /// admit several W, corresponding to different variables in the target.
+/// Unlike `factor`, which fixes the outer injection, this fixes the inner one:
+/// edge=[true,false], target=[true,false,false] admits W=[true,true,false]
+/// and W=[true,false,true]. Both compose with edge to give target.
 /// E-matching needs all these placements when traversing redundant edges.
 fn factors(target: &Thin, edge: &Thin) -> Vec<Thin> {
     fn visit(
@@ -404,6 +398,7 @@ fn factors(target: &Thin, edge: &Thin) -> Vec<Thin> {
 pub struct EGraph {
     parent: Vec<Id>,
     memo: IndexMap<Node, usize>,
+    // Rebuilt index: root class -> enodes and placements of that class in each enode.
     rev: IndexMap<usize, Vec<(Node, Thin)>>,
     rules: Vec<(Term, Term)>,
 }
@@ -537,23 +532,21 @@ impl EGraph {
             })
             .collect()
     }
-    // `top` is the ambient context at the top of the pattern; `ctx` additionally
-    // includes variables introduced locally by its binders. A pattern variable
-    // must be carried up to the top context to be carried over to the RHS.
-    // Miller parameters say which local binders it is allowed to depend on;
-    // the whole top context is retained implicitly.
+    // `ambient_ctx` counts variables outside the pattern; `current_ctx` also
+    // includes its local binders. Captures retain the ambient context implicitly
+    // and only the local binders selected by their Miller parameters.
     // https://www.philipzucker.com/ho_unify/
-    fn occurrence(top: usize, ctx: usize, args: &[usize]) -> Thin {
-        let mut bits = vec![false; ctx];
-        bits[..top].fill(true);
+    fn occurrence(ambient_ctx: usize, current_ctx: usize, args: &[usize]) -> Thin {
+        let mut bits = vec![false; current_ctx];
+        bits[..ambient_ctx].fill(true);
         for &index in args {
-            bits[ctx - 1 - index] = true;
+            bits[current_ctx - 1 - index] = true;
         }
         Thin::new(bits)
     }
-    fn matches(&self, pattern: &Term, target: &Id, subst: Subst, top: usize) -> Vec<Subst> {
+    fn matches(&self, pattern: &Term, target: &Id, subst: Subst, ambient_ctx: usize) -> Vec<Subst> {
         if let Kind::Meta(name, args) = &pattern.kind {
-            let occurrence = Self::occurrence(top, target.ctx(), args);
+            let occurrence = Self::occurrence(ambient_ctx, target.ctx(), args);
             let target = self.root(target);
             let mut subst = subst;
             if let Some(old) = subst.get(name) {
@@ -581,33 +574,44 @@ impl EGraph {
                     out.push(subst.clone())
                 }
                 (Kind::App(pf, px), Node::App(f, x)) => {
-                    for s in self.matches(pf, &f.lift(&by), subst.clone(), top) {
-                        out.extend(self.matches(px, &x.lift(&by), s, top));
+                    for s in self.matches(pf, &f.lift(&by), subst.clone(), ambient_ctx) {
+                        out.extend(self.matches(px, &x.lift(&by), s, ambient_ctx));
                     }
                 }
                 (Kind::Binder(a, p), Node::Binder(b, body)) if a == b => {
-                    out.extend(self.matches(p, &body.lift(&by.append(true)), subst.clone(), top));
+                    out.extend(self.matches(
+                        p,
+                        &body.lift(&by.append(true)),
+                        subst.clone(),
+                        ambient_ctx,
+                    ));
                 }
                 _ => {}
             }
         }
         out
     }
-    fn instantiate(&mut self, term: &Term, ctx: usize, top: usize, subst: &Subst) -> Id {
+    fn instantiate(
+        &mut self,
+        term: &Term,
+        current_ctx: usize,
+        ambient_ctx: usize,
+        subst: &Subst,
+    ) -> Id {
         match &term.kind {
             Kind::Meta(name, args) => {
-                self.root(&subst[name].lift(&Self::occurrence(top, ctx, args)))
+                self.root(&subst[name].lift(&Self::occurrence(ambient_ctx, current_ctx, args)))
             }
-            Kind::Atom(name) => self.literal(name, ctx),
-            Kind::FVar(i) => self.variable(ctx, *i),
-            Kind::BVar(i) => self.variable(ctx, ctx - 1 - i),
+            Kind::Atom(name) => self.literal(name, current_ctx),
+            Kind::FVar(i) => self.variable(current_ctx, *i),
+            Kind::BVar(i) => self.variable(current_ctx, current_ctx - 1 - i),
             Kind::App(f, x) => {
-                let f = self.instantiate(f, ctx, top, subst);
-                let x = self.instantiate(x, ctx, top, subst);
+                let f = self.instantiate(f, current_ctx, ambient_ctx, subst);
+                let x = self.instantiate(x, current_ctx, ambient_ctx, subst);
                 self.application(f, x)
             }
             Kind::Binder(op, body) => {
-                let body = self.instantiate(body, ctx + 1, top, subst);
+                let body = self.instantiate(body, current_ctx + 1, ambient_ctx, subst);
                 self.binding(op, body)
             }
         }
